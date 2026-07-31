@@ -1,0 +1,12 @@
+# Random length-matched selector configuration
+# Baseline: randomly selects messages matching length distribution
+
+selector:
+  name: random_lenmatched
+  type: random_lenmatched
+  
+  # Random seed for reproducibility
+  seed: 42
+  
+  # Token budget
+  token_budget: 100000

@@ -1,0 +1,21 @@
+# Requirements for CPU-only API replay (Colab)
+# Install: pip install -r requirements-api.txt
+
+# API interaction
+openai>=1.0.0
+tenacity>=8.2.0
+
+# Math verification
+math-verify>=0.2.0
+
+# Data handling
+datasets>=2.14.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Configuration
+pyyaml>=6.0
+ OmegaConf>=2.3.0
+
+# HuggingFace
+huggingface-hub>=0.19.0

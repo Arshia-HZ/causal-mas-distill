@@ -1,0 +1,37 @@
+# Requirements for GPU training (Kaggle T4)
+# Install: pip install -r requirements-train.txt
+# Pin versions for reproducibility
+
+# PyTorch (T4 compatible)
+torch==2.1.0
+torchvision==0.16.0
+torchaudio==2.1.0
+
+# Transformers and related
+transformers==4.36.0
+tokenizers>=0.15.0
+accelerate>=0.25.0
+
+# TRL for SFT training
+trl==0.7.6
+
+# PEFT for LoRA
+peft==0.7.1
+
+# vLLM for local inference (Kaggle)
+vllm==0.2.0
+
+# Data handling
+datasets>=2.14.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Configuration
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# HuggingFace
+huggingface-hub>=0.19.0
+
+# Evaluation
+math-verify>=0.2.0

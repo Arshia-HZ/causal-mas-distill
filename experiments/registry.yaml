@@ -1,0 +1,59 @@
+# Experiment Registry
+# One row per run → final table is generated from this
+
+experiments:
+  # Baseline: Random selection
+  - id: baseline_random
+    selector: random_lenmatched
+    student_model: Qwen/Qwen2.5-1.5B-Instruct
+    n_train_samples: 1000
+    epochs: 3
+    notes: "Random baseline with length matching"
+
+  # Baseline: Last round only
+  - id: baseline_last_round
+    selector: last_round_only
+    student_model: Qwen/Qwen2.5-1.5B-Instruct
+    n_train_samples: 1000
+    epochs: 3
+    notes: "Only final debate round"
+
+  # Baseline: Confidence-based
+  - id: baseline_confidence
+    selector: confidence
+    student_model: Qwen/Qwen2.5-1.5B-Instruct
+    n_train_samples: 1000
+    epochs: 3
+    min_confidence: 0.7
+    notes: "High confidence messages only"
+
+  # Baseline: Oracle filter
+  - id: baseline_oracle
+    selector: oracle_filter
+    student_model: Qwen/Qwen2.5-1.5B-Instruct
+    n_train_samples: 1000
+    epochs: 3
+    notes: "Upper bound: correct traces only"
+
+  # Main: Causal selection
+  - id: causal_selection_v1
+    selector: causal
+    student_model: Qwen/Qwen2.5-1.5B-Instruct
+    n_train_samples: 1000
+    epochs: 3
+    causal_alpha: 0.05
+    noise_scale: 0.1
+    notes: "Causal selection with bootstrap CIs"
+
+# Metrics to track
+metrics:
+  - accuracy
+  - tokens_selected
+  - n_messages_selected
+  - training_time
+  - inference_time
+
+# Datasets
+datasets:
+  train: Arshia-HZ/causal-mas-distill-data
+  test: /data/test.json  # Local or HF path

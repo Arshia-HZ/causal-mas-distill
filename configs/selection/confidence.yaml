@@ -1,0 +1,13 @@
+# Confidence selector configuration
+# Selects messages based on model confidence scores
+
+selector:
+  name: confidence
+  type: confidence
+  
+  # Selection parameters
+  min_confidence: 0.7
+  top_k: null
+  
+  # Token budget
+  token_budget: 100000

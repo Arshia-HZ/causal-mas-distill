@@ -1,0 +1,48 @@
+# Student model configuration - Qwen2.5-1.5B-Instruct (32k context)
+# NOT the Math variant (which has 4k context)
+
+student:
+  # Model Configuration
+  name_or_path: Qwen/Qwen2.5-1.5B-Instruct
+  max_model_len: 32768  # 32k context
+  
+  # LoRA Configuration
+  lora:
+    r: 16
+    lora_alpha: 32
+    lora_dropout: 0.05
+    bias: none
+    task_type: CAUSAL_LM
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+  
+  # Training Configuration
+  training:
+    num_train_epochs: 3
+    per_device_train_batch_size: 4
+    gradient_accumulation_steps: 2
+    learning_rate: 2.0e-4
+    warmup_ratio: 0.03
+    lr_scheduler_type: cosine
+    max_grad_norm: 0.3
+    weight_decay: 0.01
+    bf16: true
+    fp16: false
+    
+  # Data Configuration
+  data:
+    max_seq_length: 4096
+    train_split: 0.9
+    
+  # Output Configuration
+  output:
+    output_dir: checkpoints/student_qwen2.5_1.5b
+    save_strategy: epoch
+    logging_steps: 10
+    eval_strategy: epoch

@@ -1,0 +1,19 @@
+# Causal selector configuration
+# Selects messages based on estimated causal utility (Δ)
+
+selector:
+  name: causal
+  type: causal
+  
+  # Selection parameters
+  min_utility: 0.0
+  top_k: null  # No limit
+  
+  # Utility estimation
+  utility:
+    alpha: 0.05  # Confidence interval significance
+    n_bootstrap: 1000
+    noise_scale: 0.1
+    
+  # Token budget
+  token_budget: 100000  # Total tokens for selected messages

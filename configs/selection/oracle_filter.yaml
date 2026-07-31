@@ -1,0 +1,12 @@
+# Oracle filter selector configuration
+# Upper-bound baseline: uses ground truth for selection
+
+selector:
+  name: oracle_filter
+  type: oracle_filter
+  
+  # Selection parameters
+  correct_traces_only: true
+  
+  # Token budget
+  token_budget: 100000

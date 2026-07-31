@@ -1,0 +1,9 @@
+# Last round only selector configuration
+# Baseline: only selects messages from final debate round
+
+selector:
+  name: last_round_only
+  type: last_round_only
+  
+  # Token budget
+  token_budget: 100000

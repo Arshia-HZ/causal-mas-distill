@@ -1,0 +1,16 @@
+# PRM (Process Reward Model) selector configuration
+# Selects messages based on PRM scores
+
+selector:
+  name: prm
+  type: prm
+  
+  # PRM model configuration
+  prm_model: null  # Will use utilities dict if not specified
+  
+  # Selection parameters
+  min_score: 0.5
+  top_k: null
+  
+  # Token budget
+  token_budget: 100000
