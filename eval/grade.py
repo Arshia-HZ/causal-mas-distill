@@ -1,106 +1,93 @@
 """
-Grading module using math-verify for evaluation.
+Math grading using math-verify.
 
-Uses math-verify for accurate mathematical answer verification,
-not simple string matching.
+Provides accurate math answer verification.
 """
 
-from typing import Any
+from typing import Optional
 
 
-def grade_answer(
-    prediction: str,
-    ground_truth: str,
-    use_symbolic: bool = True,
-) -> dict[str, Any]:
+def is_correct(pred: str, gold: str) -> bool:
     """
-    Grade a mathematical answer using math-verify.
-
+    Check if prediction is correct using math-verify.
+    
+    Falls back to simple string matching if math-verify unavailable.
+    
     Args:
-        prediction: Predicted answer string.
-        ground_truth: Ground truth answer string.
-        use_symbolic: Whether to use symbolic verification.
-
+        pred: Predicted answer.
+        gold: Ground truth answer.
+        
     Returns:
-        Dictionary with 'correct' boolean and 'score' float.
+        True if prediction matches gold.
     """
+    # Normalize for basic comparison
+    pred_norm = pred.strip().lower()
+    gold_norm = gold.strip().lower()
+    
+    if pred_norm == gold_norm:
+        return True
+    
+    # Try math-verify
     try:
-        from math_verify import verify
+        from math_verify import parse, verify
+        return verify(parse(gold), parse(pred))
     except ImportError:
-        # Fallback to simple string matching
-        return grade_simple(prediction, ground_truth)
-
-    try:
-        # Try math-verify
-        result = verify(prediction, ground_truth, timeout=5)
-        return {
-            "correct": result,
-            "score": 1.0 if result else 0.0,
-            "method": "math_verify",
-        }
-    except Exception:
-        # Fallback to simple matching
-        return grade_simple(prediction, ground_truth)
-
-
-def grade_simple(prediction: str, ground_truth: str) -> dict[str, Any]:
-    """
-    Simple string-based grading fallback.
-
-    Args:
-        prediction: Predicted answer.
-        ground_truth: Ground truth answer.
-
-    Returns:
-        Dictionary with grading results.
-    """
-    # Normalize whitespace
-    pred_normalized = " ".join(prediction.split()).lower().strip()
-    gt_normalized = " ".join(ground_truth.split()).lower().strip()
-
-    # Direct match
-    if pred_normalized == gt_normalized:
-        return {"correct": True, "score": 1.0, "method": "exact_match"}
-
-    # Check if ground truth is contained in prediction
-    if gt_normalized in pred_normalized:
-        return {"correct": True, "score": 1.0, "method": "substring_match"}
-
-    return {"correct": False, "score": 0.0, "method": "no_match"}
+        pass
+    
+    return False
 
 
 def grade_batch(
     predictions: list[str],
-    ground_truths: list[str],
-) -> list[dict[str, Any]]:
+    gold_answers: list[str],
+) -> list[bool]:
     """
     Grade a batch of predictions.
-
+    
     Args:
         predictions: List of predicted answers.
-        ground_truths: List of ground truth answers.
-
+        gold_answers: List of ground truth answers.
+        
     Returns:
-        List of grading results.
+        List of boolean correctness values.
     """
-    results = []
-    for pred, gt in zip(predictions, ground_truths):
-        results.append(grade_answer(pred, gt))
-    return results
+    return [is_correct(p, g) for p, g in zip(predictions, gold_answers)]
 
 
-def compute_accuracy(results: list[dict[str, Any]]) -> float:
+def accuracy(predictions: list[str], gold_answers: list[str]) -> float:
     """
-    Compute accuracy from grading results.
-
+    Compute accuracy for a batch of predictions.
+    
     Args:
-        results: List of grading results.
-
+        predictions: List of predicted answers.
+        gold_answers: List of ground truth answers.
+        
     Returns:
         Accuracy as a float between 0 and 1.
     """
-    if not results:
+    if len(predictions) != len(gold_answers):
+        raise ValueError("predictions and gold_answers must have same length")
+    
+    if len(predictions) == 0:
         return 0.0
+    
+    results = grade_batch(predictions, gold_answers)
+    return sum(results) / len(results)
 
-    correct = sum(1 for r in results if r["correct"])
-    return correct / len(results)
+
+if __name__ == "__main__":
+    # Test cases
+    test_cases = [
+        ("42", "42", True),
+        ("42", "41", False),
+        ("x = 42", "42", True),
+        ("The answer is 42.", "42", True),
+        ("3.14", "3.14", True),
+        ("1/2", "0.5", True),
+    ]
+    
+    print("Testing is_correct:")
+    for pred, gold, expected in test_cases:
+        result = is_correct(pred, gold)
+        status = "✓" if result == expected else "✗"
+        print(f"  {status} is_correct({pred!r}, {gold!r}) = {result} (expected {expected})")
