@@ -1,165 +1,154 @@
 """
-Schema definitions for debate traces.
+Debate schema with Message DAG structure.
 
-Provides dataclasses for representing messages and traces in the debate loop,
-with stable message IDs and parent references for building the DAG structure.
+Each message has stable, deterministic ID (mid) and parent references
+enabling counterfactual ablation.
 """
 
 from dataclasses import dataclass, field
-from datetime import datetime
-from enum import Enum
-from typing import Any
-import uuid
-
-
-class MessageRole(str, Enum):
-    """Enumeration of message roles in the debate."""
-    SYSTEM = "system"
-    USER = "user"
-    ASSISTANT = "assistant"
-    CRITIQUE = "critique"
-    REVISION = "revision"
-
-
-class RoundType(str, Enum):
-    """Types of rounds in the debate."""
-    SOLVE = "solve"
-    CRITIQUE = "critique"
-    REVISION = "revision"
+from typing import Optional
 
 
 @dataclass
 class Message:
     """
-    A single message in the debate trace.
-
+    A single message in the debate DAG.
+    
     Attributes:
-        mid: Stable message ID (UUID).
-        parent_id: ID of the parent message (None for root).
-        role: Role of the message sender.
-        content: The message content.
-        round: Debate round number.
-        round_type: Type of round this message belongs to.
-        created_at: Timestamp of creation.
-        metadata: Additional metadata.
+        mid: Message ID in format "r{round}.{author}" (e.g., "r1.solver").
+             Stable and deterministic for ablation.
+        round: Debate round number (1-indexed).
+        role: Author role - solver, critic, or verifier.
+        text: Full message content.
+        answer: Extracted answer (if any).
+        parents: List of message IDs visible to this author.
+                 Enables topological downstream analysis.
     """
-    role: MessageRole
-    content: str
-    round: int = 0
-    round_type: RoundType = RoundType.SOLVE
-    parent_id: str | None = None
-    mid: str = field(default_factory=lambda: str(uuid.uuid4()))
-    created_at: datetime = field(default_factory=datetime.now)
-    metadata: dict[str, Any] = field(default_factory=dict)
+    mid: str
+    round: int
+    role: str  # solver | critic | verifier
+    text: str
+    answer: Optional[str] = None
+    parents: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert message to dictionary representation."""
+    def to_dict(self) -> dict:
+        """Convert to dictionary for serialization."""
         return {
             "mid": self.mid,
-            "parent_id": self.parent_id,
-            "role": self.role.value,
-            "content": self.content,
             "round": self.round,
-            "round_type": self.round_type.value,
-            "created_at": self.created_at.isoformat(),
-            "metadata": self.metadata,
+            "role": self.role,
+            "text": self.text,
+            "answer": self.answer,
+            "parents": self.parents,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Message":
-        """Create message from dictionary representation."""
+    def from_dict(cls, d: dict) -> "Message":
+        """Create from dictionary."""
         return cls(
-            mid=data["mid"],
-            parent_id=data.get("parent_id"),
-            role=MessageRole(data["role"]),
-            content=data["content"],
-            round=data.get("round", 0),
-            round_type=RoundType(data.get("round_type", "solve")),
-            created_at=datetime.fromisoformat(data["created_at"]) if "created_at" in data else datetime.now(),
-            metadata=data.get("metadata", {}),
+            mid=d["mid"],
+            round=d["round"],
+            role=d["role"],
+            text=d["text"],
+            answer=d.get("answer"),
+            parents=d.get("parents", []),
         )
 
 
 @dataclass
 class Trace:
     """
-    A complete debate trace for a problem.
-
+    Complete debate trace for a single problem.
+    
     Attributes:
-        problem: The original problem statement.
-        messages: List of messages in chronological order.
-        final_answer: The final answer (if determined).
-        utility: Estimated utility of this trace.
+        pid: Problem ID.
+        question: The problem statement.
+        gold: Ground truth answer.
+        messages: List of messages in the debate (in order).
+        final_answer: Final answer from the debate.
+        final_correct: Whether final answer is correct.
+        topology: Topology type (e.g., "solver_critic_verifier").
     """
-    problem: str
+    pid: str
+    question: str
+    gold: str
     messages: list[Message] = field(default_factory=list)
-    final_answer: str | None = None
-    utility: float | None = None
-    trace_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    final_answer: Optional[str] = None
+    final_correct: bool = False
+    topology: str = "solver_critic_verifier"
 
-    def add_message(
-        self,
-        content: str,
-        role: MessageRole,
-        round_type: RoundType,
-        parent_id: str | None = None,
-        metadata: dict[str, Any] | None = None,
-    ) -> Message:
-        """
-        Add a message to the trace.
+    def get_message(self, mid: str) -> Optional[Message]:
+        """Get message by ID."""
+        for msg in self.messages:
+            if msg.mid == mid:
+                return msg
+        return None
 
-        Args:
-            content: The message content.
-            role: Role of the message sender.
-            round_type: Type of round.
-            parent_id: ID of parent message.
-            metadata: Additional metadata.
-
-        Returns:
-            The created message.
-        """
-        round_num = self.messages[-1].round + 1 if self.messages else 0
-        if round_type == RoundType.SOLVE:
-            round_num = 0
-
-        message = Message(
-            content=content,
-            role=role,
-            round=round_num,
-            round_type=round_type,
-            parent_id=parent_id,
-            metadata=metadata or {},
-        )
-        self.messages.append(message)
-        return message
-
-    def get_messages_by_round(self, round_num: int) -> list[Message]:
+    def get_round_messages(self, round_num: int) -> list[Message]:
         """Get all messages from a specific round."""
         return [m for m in self.messages if m.round == round_num]
 
-    def get_children(self, mid: str) -> list[Message]:
-        """Get all messages that are direct children of the given message."""
-        return [m for m in self.messages if m.parent_id == mid]
+    def get_role_messages(self, role: str) -> list[Message]:
+        """Get all messages from a specific role."""
+        return [m for m in self.messages if m.role == role]
 
-    def to_dict(self) -> dict[str, Any]:
-        """Convert trace to dictionary representation."""
+    def to_dict(self) -> dict:
+        """Convert to dictionary for serialization."""
         return {
-            "trace_id": self.trace_id,
-            "problem": self.problem,
+            "pid": self.pid,
+            "question": self.question,
+            "gold": self.gold,
             "messages": [m.to_dict() for m in self.messages],
             "final_answer": self.final_answer,
-            "utility": self.utility,
+            "final_correct": self.final_correct,
+            "topology": self.topology,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "Trace":
-        """Create trace from dictionary representation."""
-        messages = [Message.from_dict(m) for m in data.get("messages", [])]
-        trace = cls(
-            problem=data["problem"],
-            messages=messages,
-            final_answer=data.get("final_answer"),
-            utility=data.get("utility"),
-            trace_id=data.get("trace_id", str(uuid.uuid4())),
+    def from_dict(cls, d: dict) -> "Trace":
+        """Create from dictionary."""
+        return cls(
+            pid=d["pid"],
+            question=d["question"],
+            gold=d["gold"],
+            messages=[Message.from_dict(m) for m in d.get("messages", [])],
+            final_answer=d.get("final_answer"),
+            final_correct=d.get("final_correct", False),
+            topology=d.get("topology", "solver_critic_verifier"),
         )
-        return trace
+
+
+def descendants(trace: Trace, mid: str) -> set[str]:
+    """
+    Get all message IDs that are topologically downstream of mid.
+    
+    Args:
+        trace: The debate trace.
+        mid: Message ID to find descendants for.
+        
+    Returns:
+        Set of message IDs that depend on the given message.
+    """
+    mid_to_msg = {m.mid: m for m in trace.messages}
+    downstream = set()
+    queue = [mid]
+    
+    while queue:
+        current = queue.pop()
+        # Find messages that have current in their parents
+        for msg in trace.messages:
+            if msg.mid not in downstream and current in msg.parents:
+                downstream.add(msg.mid)
+                queue.append(msg.mid)
+    
+    return downstream
+
+
+def topo_order(mids: set[str]) -> list[str]:
+    """
+    Topological sort of message IDs based on parent relationships.
+    
+    Note: This requires the trace context for actual parent info.
+    This is a placeholder that returns sorted order.
+    """
+    return sorted(mids)

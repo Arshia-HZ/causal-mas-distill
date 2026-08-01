@@ -1,117 +1,136 @@
 """
-API backend for OpenAI-compatible model inference.
+API Backend for OpenAI-compatible model inference.
 
-Features:
-- OpenAI-compatible API calls
-- Disk caching for reproducibility
-- Automatic retry with tenacity
-- Semaphore-based rate limiting
+Works with DeepSeek, OpenRouter, Gemini-compatible, DashScope.
+Includes disk caching, retry logic, and semaphore-based concurrency control.
 """
 
+import asyncio
 import hashlib
 import json
-import time
+import os
+import random
 from pathlib import Path
-from typing import Any
 
-import openai
-from tenacity import retry, stop_after_attempt, wait_exponential
-
-from .base import Backend
+from openai import AsyncOpenAI
 
 
-class APIBackend(Backend):
-    """API-based backend with caching and retry logic."""
+def key_of(payload) -> str:
+    """Generate cache key from payload using SHA256 hash."""
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()[:32]
+
+
+class ApiBackend:
+    """
+    OpenAI-compatible async backend with caching and retry.
+    
+    Works with DeepSeek, OpenRouter, Gemini-compatible, DashScope.
+    Supports n>1 sampling via batching for APIs that don't support n parameter.
+    """
 
     def __init__(
         self,
+        model: str,
         base_url: str,
-        api_key: str | None = None,
-        model: str = "gpt-4o-mini",
-        cache_dir: Path | None = None,
-        max_concurrent: int = 10,
+        api_key_env: str,
+        cache_path: str,
+        concurrency: int = 24,
+        max_tokens: int = 768,
+        supports_n: bool = True,
     ):
-        """
-        Initialize API backend.
-
-        Args:
-            base_url: Base URL for OpenAI-compatible API.
-            api_key: API key for authentication.
-            model: Model name to use.
-            cache_dir: Directory for disk caching.
-            max_concurrent: Maximum concurrent requests.
-        """
-        self.client = openai.OpenAI(base_url=base_url, api_key=api_key)
         self.model = model
-        self.cache_dir = cache_dir
-        self._semaphore: Any = None  # Will be initialized on first use
+        self.max_tokens = max_tokens
+        self.supports_n = supports_n
+        
+        self.client = AsyncOpenAI(
+            api_key=os.environ[api_key_env],
+            base_url=base_url
+        )
+        
+        self.sem = asyncio.Semaphore(concurrency)
+        self.lock = asyncio.Lock()
+        
+        self.p = Path(cache_path)
+        self.p.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Load existing cache
+        self.cache = {}
+        if self.p.exists():
+            for line in self.p.open():
+                try:
+                    r = json.loads(line)
+                    self.cache[r["k"]] = r["v"]
+                except json.JSONDecodeError:
+                    pass  # tolerate truncated last line
+        
+        self.fh = self.p.open("a")
 
-    def generate(
+    async def _one(self, messages, n: int, temperature: float):
+        """Single generation attempt with retry logic."""
+        for attempt in range(6):
+            try:
+                if self.supports_n:
+                    r = await self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        n=n,
+                        temperature=temperature,
+                        max_tokens=self.max_tokens
+                    )
+                    return [c.message.content for c in r.choices]
+                
+                # Batch requests for APIs without n support
+                outs = await asyncio.gather(*[
+                    self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        n=1,
+                        temperature=temperature,
+                        max_tokens=self.max_tokens
+                    )
+                    for _ in range(n)
+                ])
+                return [o.choices[0].message.content for o in outs]
+                
+            except Exception:
+                if attempt == 5:
+                    raise
+                await asyncio.sleep(2 ** attempt + random.random())
+
+    async def generate(
         self,
         messages: list[dict],
         n: int = 1,
-        temperature: float = 1.0,
-        max_tokens: int | None = None,
+        temperature: float = 0.7
     ) -> list[str]:
-        """Generate completions with caching and retry."""
-        # Check cache first
-        if self.cache_dir:
-            cache_key = self._make_cache_key(messages, n, temperature, max_tokens)
-            cached = self._read_cache(cache_key)
-            if cached:
-                return cached
+        """
+        Generate completions with caching.
+        
+        Args:
+            messages: Chat messages.
+            n: Number of samples.
+            temperature: Sampling temperature.
+            
+        Returns:
+            List of generated text completions.
+        """
+        k = key_of({"m": messages, "n": n, "t": temperature, "mo": self.model})
+        
+        if k in self.cache:
+            return self.cache[k]
+        
+        async with self.sem:
+            out = await self._one(messages, n, temperature)
+        
+        async with self.lock:
+            self.cache[k] = out
+            self.fh.write(json.dumps({"k": k, "v": out}) + "\n")
+            self.fh.flush()
+        
+        return out
 
-        # Generate with retry
-        response = self._generate_with_retry(messages, n, temperature, max_tokens)
-
-        # Extract content
-        completions = [choice.message.content for choice in response.choices]
-
-        # Cache results
-        if self.cache_dir:
-            self._write_cache(cache_key, completions)
-
-        return completions
-
-    def _make_cache_key(
-        self,
-        messages: list[dict],
-        n: int,
-        temperature: float,
-        max_tokens: int | None,
-    ) -> str:
-        """Create a cache key from request parameters."""
-        payload = json.dumps({"messages": messages, "n": n, "temperature": temperature, "max_tokens": max_tokens}, sort_keys=True)
-        return hashlib.sha256(payload.encode()).hexdigest()
-
-    def _read_cache(self, cache_key: str) -> list[str] | None:
-        """Read cached completions if available."""
-        cache_file = self.cache_dir / f"{cache_key}.json"
-        if cache_file.exists():
-            with open(cache_file) as f:
-                return json.load(f)
-        return None
-
-    def _write_cache(self, cache_key: str, completions: list[str]) -> None:
-        """Write completions to cache."""
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_file = self.cache_dir / f"{cache_key}.json"
-        with open(cache_file, "w") as f:
-            json.dump(completions, f)
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def _generate_with_retry(
-        self,
-        messages: list[dict],
-        n: int,
-        temperature: float,
-        max_tokens: int | None,
-    ) -> Any:
-        """Generate with automatic retry on failure."""
-        return self.client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            n=n,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
+    def close(self):
+        """Close file handle."""
+        self.fh.close()

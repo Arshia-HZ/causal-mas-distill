@@ -1,177 +1,219 @@
 """
-Counterfactual replay module.
+Counterfactual replay for causal utility estimation.
 
-Provides topological downstream regeneration of traces,
-enabling counterfactual analysis by replaying parts of the debate
-with modified inputs.
+Core function: message_utility()
+- Ablates a message from the debate
+- Regenerates all topologically downstream messages
+- Computes utility as the change in outcome probability
 """
 
-from collections import deque
+import asyncio
+import re
 from typing import Any
 
-from ..backends.base import Backend
-from ..debate.schema import Message, MessageRole, RoundType, Trace
+from ..debate.schema import Trace, Message, descendants
+
+
+def extract_answer(text: str) -> str | None:
+    """Extract answer from text using common patterns."""
+    # Try to find answer after "Answer:" or "The answer is"
+    patterns = [
+        r"(?:The )?answer(?:\s+is)?:?\s*(.+)",
+        r"####\s*(.+)",
+        r"\$\$?\s*(.+?)\s*\$\$?$",
+        r"\(([^)]+)\)$",  # Answer in parentheses at end
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, text.strip(), re.IGNORECASE | re.MULTILINE)
+        if match:
+            return match.group(1).strip()
+    
+    return None
+
+
+def is_correct(pred: str, gold: str) -> bool:
+    """
+    Check if prediction is correct using math-verify if available.
+    
+    Falls back to simple string matching.
+    """
+    # Normalize
+    pred_norm = pred.strip().lower()
+    gold_norm = gold.strip().lower()
+    
+    if pred_norm == gold_norm:
+        return True
+    
+    # Try math-verify
+    try:
+        from math_verify import parse, verify
+        return verify(parse(gold), parse(pred))
+    except ImportError:
+        pass
+    
+    return False
+
+
+def build_prompt(trace: Trace, node: str, ctx: dict[str, Message]) -> list[dict]:
+    """
+    Build prompt for regenerating a message with ablated context.
+    
+    Args:
+        trace: Original trace.
+        node: Node ID to regenerate.
+        ctx: Context with ablated message removed.
+        
+    Returns:
+        List of message dicts for API call.
+    """
+    msg = trace.get_message(node)
+    if msg is None:
+        raise ValueError(f"Unknown node: {node}")
+    
+    messages = []
+    
+    # System prompt
+    messages.append({
+        "role": "system",
+        "content": f"You are a {msg.role}. Provide a response to the question."
+    })
+    
+    # User: problem
+    messages.append({
+        "role": "user",
+        "content": trace.question
+    })
+    
+    # Add context messages (excluding ablated message and its downstream)
+    for m in trace.messages:
+        if m.mid in ctx:
+            role = "assistant" if m.role in ("solver", "critic", "verifier") else "user"
+            messages.append({
+                "role": role,
+                "content": m.text
+            })
+    
+    return messages
+
+
+def final_answer_of(ctx: dict[str, Message]) -> str | None:
+    """Get final answer from context."""
+    # Find last message with an answer
+    for mid in sorted(ctx.keys(), reverse=True):
+        msg = ctx[mid]
+        if msg.answer:
+            return msg.answer
+    return None
+
+
+def replace(msg: Message, **kwargs) -> Message:
+    """Create a new Message with updated fields."""
+    return Message(
+        mid=msg.mid,
+        round=kwargs.get("round", msg.round),
+        role=kwargs.get("role", msg.role),
+        text=kwargs.get("text", msg.text),
+        answer=kwargs.get("answer", msg.answer),
+        parents=kwargs.get("parents", msg.parents),
+    )
+
+
+async def message_utility(
+    trace: Trace,
+    mid: str,
+    backend: Any,
+    k: int = 16,
+    temperature: float = 0.7
+) -> float:
+    """
+    Compute causal utility of a message via counterfactual replay.
+    
+    Args:
+        trace: Original debate trace.
+        mid: Message ID to ablate.
+        backend: API backend for generation.
+        k: Number of samples for estimation.
+        temperature: Sampling temperature.
+        
+    Returns:
+        Causal utility (Δ) as proportion correct improvement.
+    """
+    # Get downstream messages
+    downstream = descendants(trace, mid)
+    
+    correct = 0
+    for _ in range(k):
+        # Build context without the ablated message
+        ctx = {
+            m.mid: m for m in trace.messages
+            if m.mid != mid and m.mid not in downstream
+        }
+        
+        # Regenerate each downstream message in topological order
+        downstream_list = sorted(downstream)
+        for node_mid in downstream_list:
+            node_msg = trace.get_message(node_mid)
+            if node_msg is None:
+                continue
+                
+            msgs = build_prompt(trace, node_mid, ctx)
+            txt = (await backend.generate(msgs, n=1, temperature=temperature))[0]
+            ans = extract_answer(txt)
+            
+            ctx[node_mid] = replace(node_msg, text=txt, answer=ans)
+        
+        # Check if counterfactual is correct
+        final_ans = final_answer_of(ctx)
+        if final_ans and is_correct(final_ans, trace.gold):
+            correct += 1
+    
+    return correct / k
 
 
 class CounterfactualReplay:
-    """
-    Replayer for counterfactual analysis of debate traces.
-
-    This enables regeneration of downstream messages when upstream
-    messages are modified, using topological ordering.
-    """
-
-    def __init__(self, backend: Backend, max_tokens: int | None = None, temperature: float = 0.7):
-        """
-        Initialize the counterfactual replayer.
-
-        Args:
-            backend: Backend for model inference.
-            max_tokens: Maximum tokens per generation.
-            temperature: Sampling temperature.
-        """
+    """Manager for counterfactual replay operations."""
+    
+    def __init__(self, backend: Any):
         self.backend = backend
-        self.max_tokens = max_tokens
-        self.temperature = temperature
-
-    def replay_from(
+    
+    async def replay_from(
         self,
         trace: Trace,
-        from_mid: str,
-        modified_content: str | None = None,
+        mid: str,
+        k: int = 16,
+        temperature: float = 0.7
     ) -> Trace:
         """
-        Replay the trace starting from a modified message.
-
-        Args:
-            trace: Original trace.
-            from_mid: Message ID to start replaying from.
-            modified_content: New content for the starting message (if any).
-
+        Replay a trace with a specific message ablated.
+        
         Returns:
-            New trace with regenerated downstream messages.
+            New trace with ablated message and regenerated downstream.
         """
-        # Build the DAG
-        dag = self._build_dag(trace)
-
-        # Find all downstream messages
-        downstream = self._get_downstream(dag, from_mid)
-
-        # Create new trace with prefix
-        new_trace = self._create_prefix_trace(trace, from_mid, modified_content)
-
-        # Process downstream messages in topological order
-        for mid in downstream:
-            msg = dag[mid]
-            parent_msg = dag.get(msg.parent_id) if msg.parent_id else None
-
-            # Get parent content for context
-            if parent_msg and parent_msg.parent_id:
-                grandparent_msg = dag.get(parent_msg.parent_id)
-            else:
-                grandparent_msg = None
-
-            # Regenerate the message
-            new_content = self._regenerate_message(msg, parent_msg, grandparent_msg, new_trace.problem)
-
-            # Add to new trace
-            new_trace.add_message(
-                content=new_content,
-                role=msg.role,
-                round_type=msg.round_type,
-                parent_id=new_trace.messages[-1].mid if new_trace.messages else None,
-                metadata=msg.metadata,
-            )
-
-        return new_trace
-
-    def _build_dag(self, trace: Trace) -> dict[str, Message]:
-        """Build a DAG (directed acyclic graph) from the trace."""
-        return {msg.mid: msg for msg in trace.messages}
-
-    def _get_downstream(self, dag: dict[str, Message], from_mid: str) -> list[str]:
-        """
-        Get all message IDs downstream of the given message, in topological order.
-
-        Args:
-            dag: Dictionary mapping message IDs to messages.
-            from_mid: Starting message ID.
-
-        Returns:
-            List of downstream message IDs in topological order.
-        """
-        visited = set()
-        result = []
-
-        def topological_sort(start_mid: str) -> None:
-            """DFS topological sort."""
-            if start_mid in visited:
-                return
-            visited.add(start_mid)
-
-            # Find children
-            children = [mid for mid, msg in dag.items() if msg.parent_id == start_mid]
-            for child_mid in children:
-                topological_sort(child_mid)
-                if child_mid not in result:
-                    result.append(child_mid)
-
-        topological_sort(from_mid)
-        return result
-
-    def _create_prefix_trace(
+        util = await message_utility(trace, mid, self.backend, k, temperature)
+        
+        # For now, just return the utility value
+        # Full trace reconstruction would require storing all intermediate states
+        return util
+    
+    async def compute_utilities(
         self,
-        trace: Trace,
-        from_mid: str,
-        modified_content: str | None,
-    ) -> Trace:
-        """Create a new trace with the prefix up to (but not including) from_mid."""
-        new_trace = Trace(problem=trace.problem)
-
-        for msg in trace.messages:
-            if msg.mid == from_mid:
-                break
-            content = modified_content if msg.mid == from_mid and modified_content else msg.content
-            new_trace.add_message(
-                content=content,
-                role=msg.role,
-                round_type=msg.round_type,
-                parent_id=msg.parent_id,
-                metadata=msg.metadata,
-            )
-
-        return new_trace
-
-    def _regenerate_message(
-        self,
-        msg: Message,
-        parent_msg: Message | None,
-        grandparent_msg: Message | None,
-        problem: str,
-    ) -> str:
+        traces: list[Trace],
+        k: int = 16,
+        temperature: float = 0.7
+    ) -> dict[str, float]:
         """
-        Regenerate a message based on its type and context.
-
-        Args:
-            msg: Message to regenerate.
-            parent_msg: Parent message.
-            grandparent_msg: Grandparent message (for context).
-            problem: Original problem statement.
-
+        Compute utilities for all messages in traces.
+        
         Returns:
-            Generated message content.
+            Dict mapping mid to utility value.
         """
-        from ..debate.prompts import get_critique_prompt, get_revision_prompt
-
-        if msg.round_type == RoundType.CRITIQUE and parent_msg:
-            prompt = get_critique_prompt(parent_msg.content)
-        elif msg.round_type == RoundType.REVISION and parent_msg and grandparent_msg:
-            prompt = get_revision_prompt(problem, grandparent_msg.content, parent_msg.content)
-        else:
-            # Fallback: just return original content
-            return msg.content
-
-        messages = [{"role": "user", "content": prompt}]
-        results = self.backend.generate(messages, n=1, temperature=self.temperature, max_tokens=self.max_tokens)
-
-        return results[0] if results else msg.content
+        utilities = {}
+        
+        for trace in traces:
+            for msg in trace.messages:
+                if msg.round > 0:  # Skip root message
+                    util = await message_utility(trace, msg.mid, self.backend, k, temperature)
+                    utilities[f"{trace.pid}:{msg.mid}"] = util
+        
+        return utilities
