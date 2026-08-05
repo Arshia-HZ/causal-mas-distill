@@ -123,10 +123,10 @@ All data persists on HF Hub:
 from huggingface_hub import snapshot_download, upload_folder
 
 # Download
-snapshot_download("YOURNAME/causal-mas-distill-data", repo_type="dataset", local_dir="data")
+snapshot_download("Arshia-HZ/causal-mas-distill-data", repo_type="dataset", local_dir="data")
 
 # Upload after work
-upload_folder(folder_path="data", repo_id="YOURNAME/causal-mas-distill-data", repo_type="dataset")
+upload_folder(folder_path="data", repo_id="Arshia-HZ/causal-mas-distill-data", repo_type="dataset")
 ```
 
 ## HF Hub Repos
