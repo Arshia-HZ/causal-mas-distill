@@ -9,7 +9,7 @@ description = "Causal MAS Distillation: Improving Student Models with Causal Sel
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
-    {name = "Arshia HZ", email = "your.email@example.com"}
+    {name = "Arshia HZ", email = "info@arshialab.ir"}
 ]
 requires-python = ">=3.10"
 keywords = ["causal", "distillation", "llm", "reasoning", "debate"]
@@ -57,9 +57,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Arshia-HZ/CMD"
-Repository = "https://github.com/Arshia-HZ/CMD"
-Documentation = "https://github.com/Arshia-HZ/CMD#readme"
+Homepage = "https://github.com/Arshia-HZ/causal-mas-distill"
+Repository = "https://github.com/Arshia-HZ/causal-mas-distill"
+Documentation = "https://github.com/Arshia-HZ/causal-mas-distill#readme"
 
 [tool.setuptools.packages.find]
 where = ["."]

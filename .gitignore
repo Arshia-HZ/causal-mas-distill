@@ -124,3 +124,8 @@ wandb/
 
 # Local development
 .local/
+
+# Graphify knowledge graph
+graphify-out/
+.graphify*
+*.zip

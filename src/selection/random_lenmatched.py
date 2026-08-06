@@ -28,42 +28,43 @@ class RandomLenMatchedSelector(Selector):
             seed: Random seed for reproducibility.
         """
         self.seed = seed
-        random.seed(seed)
+        self._rng = random.Random(seed)
 
     def select(
         self,
         traces: list[Any],
-        utilities: dict[str, float],
+        utilities: dict[tuple[str, str], float],
         token_budget: int,
-    ) -> list[str]:
+    ) -> dict[str, list[str]]:
         """
         Select messages randomly within token budget.
 
         Args:
             traces: List of debate traces.
-            utilities: Dictionary mapping message IDs to utility scores.
+            utilities: Dictionary mapping (trace_id, mid) to utility scores.
             token_budget: Maximum tokens allowed.
 
         Returns:
-            List of selected message IDs.
+            Dictionary mapping trace_id to list of selected message IDs.
         """
         # Collect all messages
         all_messages = []
         for trace in traces:
+            trace_id = getattr(trace, "trace_id", getattr(trace, "pid", ""))
             for msg in trace.messages:
-                tokens = self._estimate_tokens(msg.content)
-                all_messages.append((msg.mid, msg.content, tokens))
+                tokens = self._estimate_tokens(msg.text)
+                all_messages.append((trace_id, msg.mid, tokens))
 
         # Shuffle
-        random.shuffle(all_messages)
+        self._rng.shuffle(all_messages)
 
         # Select within budget
-        selected = []
+        selected = {}
         total_tokens = 0
 
-        for mid, content, tokens in all_messages:
+        for trace_id, mid, tokens in all_messages:
             if total_tokens + tokens <= token_budget:
-                selected.append(mid)
+                selected.setdefault(trace_id, []).append(mid)
                 total_tokens += tokens
 
         return selected

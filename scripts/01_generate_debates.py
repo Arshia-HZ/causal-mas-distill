@@ -5,10 +5,14 @@ Runs the debate harness to generate debate traces for selected problems.
 """
 
 import argparse
+import asyncio
 import json
+import sys
 from pathlib import Path
 
-from src.backends.api import APIBackend
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.backends.api import ApiBackend
 from src.debate.harness import DebateHarness
 
 
@@ -18,21 +22,32 @@ def main():
     parser.add_argument("--output", type=str, required=True, help="Output path for traces")
     parser.add_argument("--api-url", type=str, required=True, help="API base URL")
     parser.add_argument("--api-key", type=str, default=None, help="API key")
-    parser.add_argument("--model", type=str, default="deepseek-chat", help="Model name")
+    parser.add_argument("--model", type=str, default="deepseek-v4-flash", help="Model name")
     parser.add_argument("--max-rounds", type=int, default=3, help="Max debate rounds")
     parser.add_argument("--n-solutions", type=int, default=1, help="Solutions per problem")
+    parser.add_argument("--cache-path", type=str, default="cache.jsonl", help="Path to API cache")
     args = parser.parse_args()
 
     # Load problems
     with open(args.problems) as f:
         problems_data = json.load(f)
-    problems = [p["problem"] for p in problems_data]
+        
+    problems = []
+    for i, p in enumerate(problems_data):
+        problems.append({
+            "pid": p.get("pid") or p.get("id") or str(i),
+            "question": p.get("question") or p.get("problem") or "",
+            "gold": p.get("gold") or p.get("answer") or "",
+        })
 
     # Create backend
-    backend = APIBackend(
+    backend = ApiBackend(
         base_url=args.api_url,
         api_key=args.api_key,
         model=args.model,
+        cache_path=args.cache_path,
+        supports_n=False,  # DeepSeek chat API has no n parameter
+        extra_body={"thinking": {"type": "disabled"}},  # hidden CoT breaks ablation
     )
 
     # Create harness
@@ -42,11 +57,15 @@ def main():
     )
 
     # Generate debates
-    all_traces = []
-    for i, problem in enumerate(problems):
-        print(f"Generating debate {i+1}/{len(problems)}...")
-        traces = harness.run(problem, n_solutions=args.n_solutions)
-        all_traces.extend(traces)
+    print(f"Generating debates for {len(problems)} problems...")
+    
+    def progress_callback(completed, total):
+        if completed % 10 == 0 or completed == total:
+            print(f"Generated {completed}/{total} traces...")
+            
+    all_traces = asyncio.run(
+        harness.run_parallel(problems, n_solutions_per_problem=args.n_solutions, progress_callback=progress_callback)
+    )
 
     # Save traces
     output_path = Path(args.output)

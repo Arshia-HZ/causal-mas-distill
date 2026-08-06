@@ -1,15 +1,11 @@
 """
-Debate prompts for RCR (Reason to Criticize and Revise) framework.
+Project-authored prompts for an RCR-style deliberation protocol.
 
-This module contains the prompt templates for the debate/argumentation loop,
-vendored from DeepThought-Evals (DTE) under MIT license.
-Attribution: RCR prompts from DTE, MIT License.
+Conceptually inspired by reason–critique–revise methods.
+No third-party prompt text is vendored.
+
+Prompt version: rcr_v2
 """
-
-# =============================================================================
-# RCR Prompts - Vendored from DeepThought-Evals (DTE)
-# MIT License - https://github.com/princeton-nlp/DeepThought-Evals
-# =============================================================================
 
 RCR_SYSTEM_PROMPT = """You are a helpful AI assistant engaging in a critical thinking exercise.
 
@@ -22,7 +18,11 @@ Follow these guidelines:
 4. Be rigorous but constructive
 """
 
-RCR_CRITIQUE_PROMPT = """You are helping with a problem. Below is a proposed solution:
+RCR_CRITIQUE_PROMPT = """You are helping with a problem. Here is the original problem:
+
+{problem}
+
+Below is a proposed solution:
 
 {previous_solution}
 
@@ -54,13 +54,13 @@ RCR_SOLVE_PROMPT = """Solve the following problem step by step. Show your reason
 {problem}
 """
 
-# =============================================================================
-# End of vendored content from DTE
-# =============================================================================
 
-def get_critique_prompt(previous_solution: str) -> str:
-    """Get the critique prompt with the previous solution filled in."""
-    return RCR_CRITIQUE_PROMPT.format(previous_solution=previous_solution)
+def get_critique_prompt(problem: str, previous_solution: str) -> str:
+    """Get the critique prompt with the problem and previous solution filled in."""
+    return RCR_CRITIQUE_PROMPT.format(
+        problem=problem, 
+        previous_solution=previous_solution
+    )
 
 def get_revision_prompt(problem: str, previous_solution: str, critique: str) -> str:
     """Get the revision prompt with all fields filled in."""

@@ -6,7 +6,10 @@ Trains the student model with LoRA on the selected dataset.
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.distill.sft import DistillationTrainer
 
@@ -29,30 +32,19 @@ def main():
     print(f"Loaded {len(examples)} training examples")
 
     # Create trainer
-    training_args = {
-        "num_train_epochs": args.epochs,
-        "per_device_train_batch_size": args.batch_size,
-        "learning_rate": args.lr,
-        "bf16": True,
-        "save_strategy": "epoch",
-        "logging_steps": 10,
-    }
-
     trainer = DistillationTrainer(
         model_name_or_path=args.model,
         output_dir=Path(args.output_dir),
-        training_args=training_args,
+        max_seq_length=args.max_seq_length,
     )
-
-    # Prepare dataset
-    dataset = trainer.prepare_dataset(examples)
-    print(f"Prepared dataset with {len(dataset)} examples")
 
     # Train
     print("Starting training...")
     trainer.train(
-        train_dataset=dataset,
-        max_seq_length=args.max_seq_length,
+        train_dataset=examples,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        learning_rate=args.lr,
     )
 
     print(f"Training complete. Checkpoints saved to {args.output_dir}")

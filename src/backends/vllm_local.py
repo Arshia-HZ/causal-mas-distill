@@ -1,7 +1,7 @@
 """
 vLLM backend for local GPU inference.
 
-Provides the same interface as APIBackend but runs models locally
+Provides the same interface as ApiBackend but runs models locally
 using vLLM for efficient inference on Kaggle or local machines.
 """
 
@@ -51,12 +51,13 @@ class VLLMBackend(Backend):
                 dtype=self.dtype,
             )
 
-    def generate(
+    async def generate(
         self,
         messages: list[dict],
         n: int = 1,
-        temperature: float = 1.0,
+        temperature: float = 0.7,
         max_tokens: int | None = None,
+        cache_nonce: str | None = None,
     ) -> list[str]:
         """
         Generate completions using local vLLM engine.
@@ -66,6 +67,7 @@ class VLLMBackend(Backend):
             n: Number of completions to generate.
             temperature: Sampling temperature.
             max_tokens: Maximum tokens to generate.
+            cache_nonce: Optional string to differentiate cache keys.
 
         Returns:
             List of generated completion strings.
@@ -75,7 +77,8 @@ class VLLMBackend(Backend):
         # Convert messages to prompt string
         prompt = self._messages_to_prompt(messages)
 
-        # Generate with vLLM
+        # Generate with vLLM in a thread so we don't block the async loop
+        import asyncio
         from vllm import SamplingParams
 
         sampling_params = SamplingParams(
@@ -84,7 +87,7 @@ class VLLMBackend(Backend):
             max_tokens=max_tokens or 2048,
         )
 
-        outputs = self._llm.generate([prompt], sampling_params)
+        outputs = await asyncio.to_thread(self._llm.generate, [prompt], sampling_params)
 
         # Extract completions
         return [output.outputs[i].text for output in outputs for i in range(n)]

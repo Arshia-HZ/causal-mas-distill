@@ -106,29 +106,27 @@ class UtilityEstimator:
 
     def compute_noise_floor_threshold(
         self,
-        baseline_outcomes: list[float],
-        noise_scale: float = 0.1,
+        placebo_diffs: list[float],
+        quantile: float = 0.95,
     ) -> float:
         """
         Compute the noise-floor threshold τ for go/no-go decisions.
 
-        The threshold is based on the variance of baseline outcomes
-        plus expected noise from sampling.
+        The threshold is based on the specified quantile of the absolute
+        differences observed in a placebo (unablated) condition.
 
         Args:
-            baseline_outcomes: Baseline outcome measurements.
-            noise_scale: Expected relative noise scale.
+            placebo_diffs: Differences between unablated repeats.
+            quantile: The quantile to use as the threshold (default: 0.95).
 
         Returns:
             Threshold value τ.
         """
-        baseline = np.array(baseline_outcomes)
-        variance = np.var(baseline)
-        mean_abs = np.mean(np.abs(baseline))
-
-        # τ = sqrt(variance) + noise_scale * mean(|baseline|)
-        tau = np.sqrt(variance) + noise_scale * mean_abs
-
+        if not placebo_diffs:
+            return 0.0
+            
+        abs_diffs = np.abs(placebo_diffs)
+        tau = np.quantile(abs_diffs, quantile)
         return float(tau)
 
     def is_significant(

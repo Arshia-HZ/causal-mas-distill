@@ -62,7 +62,7 @@ def run_evaluation(
     metrics = {
         "accuracy": accuracy,
         "n_examples": len(test_data),
-        "n_correct": sum(1 for r in results if r["correct"]),
+        "n_correct": sum(1 for r in results if r),
         "results": results,
     }
 

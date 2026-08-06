@@ -6,6 +6,7 @@ Uses sdpa attention (no flash_attention_2 on T4).
 """
 
 import os
+import yaml
 import torch
 from pathlib import Path
 from typing import Optional, Union
@@ -17,10 +18,6 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig
-
-
-# Model configuration
-BASE_MODEL = "Qwen/Qwen2.5-1.5B-Instruct"  # 32k ctx. NOT Qwen2.5-Math (4k ctx!)
 
 
 class DistillationTrainer:
@@ -35,12 +32,18 @@ class DistillationTrainer:
 
     def __init__(
         self,
-        model_name_or_path: str = BASE_MODEL,
+        model_name_or_path: str = None,
         output_dir: Union[str, Path] = "/kaggle/working/out",
         max_seq_length: int = 2048,
         seed: int = 42,
+        config_path: str = "configs/student_qwen2.5_1.5b.yaml",
     ):
-        self.model_name = model_name_or_path
+        self.config = {}
+        if config_path and Path(config_path).exists():
+            with open(config_path) as f:
+                self.config = yaml.safe_load(f).get("student", {})
+                
+        self.model_name = model_name_or_path or self.config.get("name_or_path", "Qwen/Qwen2.5-1.5B-Instruct")
         self.output_dir = Path(output_dir)
         self.max_seq_length = max_seq_length
         self.seed = seed
@@ -59,10 +62,14 @@ class DistillationTrainer:
         self.dtype = torch.float16  # T4 = sm_75: NO bfloat16
         self.attn_implementation = "sdpa"  # T4: NO flash_attention_2
         
-        # Check for newer GPUs that support bf16
-        if torch.cuda.is_available():
+        # Check config first
+        if self.config.get("training", {}).get("bf16"):
+            self.dtype = torch.bfloat16
+            
+        # Or auto-detect if newer GPUs that support bf16
+        elif torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(0).lower()
-            if "a100" in gpu_name or "h100" in gpu_name or "l40" in gpu_name:
+            if "a100" in gpu_name or "h100" in gpu_name or "l40" in gpu_name or "rtx 30" in gpu_name or "rtx 40" in gpu_name:
                 self.dtype = torch.bfloat16
 
     def _prepare_model(self):
@@ -80,17 +87,18 @@ class DistillationTrainer:
             device_map={"": 0},
         )
         
-        # LoRA config for Qwen
+        lora_cfg = self.config.get("lora", {})
+        
         peft_cfg = LoraConfig(
-            r=32,
-            lora_alpha=64,
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=[
+            r=lora_cfg.get("r", 16),
+            lora_alpha=lora_cfg.get("lora_alpha", 32),
+            lora_dropout=lora_cfg.get("lora_dropout", 0.05),
+            bias=lora_cfg.get("bias", "none"),
+            task_type=lora_cfg.get("task_type", "CAUSAL_LM"),
+            target_modules=lora_cfg.get("target_modules", [
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
-            ],
+            ]),
         )
         
         self.model = get_peft_model(self.model, peft_cfg)
@@ -101,9 +109,9 @@ class DistillationTrainer:
         from datasets import Dataset
         
         def format_example(ex):
-            return {
-                "text": ex.get("text", ex.get("input", "")) + "\nAnswer: " + ex.get("output", ex.get("label", ""))
-            }
+            if ex.get("text"):
+                return {"text": ex["text"]}
+            return {"text": ex.get("input", "") + "\nAnswer: " + ex.get("output", ex.get("label", ""))}
         
         formatted = [format_example(ex) for ex in examples]
         return Dataset.from_list(formatted)
@@ -121,16 +129,6 @@ class DistillationTrainer:
     ):
         """
         Run SFT training.
-        
-        Args:
-            train_dataset: Training dataset.
-            max_seq_length: Max sequence length (default: self.max_seq_length).
-            num_train_epochs: Number of epochs.
-            per_device_train_batch_size: Batch size per device.
-            gradient_accumulation_steps: Gradient accumulation steps.
-            learning_rate: Learning rate.
-            warmup_ratio: Warmup ratio.
-            push_to_hub: Optional HF repo to push final model.
         """
         self._prepare_model()
         
@@ -140,18 +138,20 @@ class DistillationTrainer:
         if isinstance(train_dataset, list):
             train_dataset = self._prepare_dataset(train_dataset)
         
+        training_cfg = self.config.get("training", {})
+        
         # SFT config - T4 safe
         sft_cfg = SFTConfig(
             output_dir=str(self.output_dir),
-            per_device_train_batch_size=per_device_train_batch_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            num_train_epochs=num_train_epochs,
-            learning_rate=learning_rate,
-            lr_scheduler_type="cosine",
-            warmup_ratio=warmup_ratio,
-            fp16=True,  # T4 = sm_75: NO bfloat16
-            bf16=False,
-            max_grad_norm=1.0,  # clipping matters: Qwen+fp16 can NaN
+            per_device_train_batch_size=training_cfg.get("per_device_train_batch_size", per_device_train_batch_size),
+            gradient_accumulation_steps=training_cfg.get("gradient_accumulation_steps", gradient_accumulation_steps),
+            num_train_epochs=training_cfg.get("num_train_epochs", num_train_epochs),
+            learning_rate=training_cfg.get("learning_rate", learning_rate),
+            lr_scheduler_type=training_cfg.get("lr_scheduler_type", "cosine"),
+            warmup_ratio=training_cfg.get("warmup_ratio", warmup_ratio),
+            fp16=training_cfg.get("fp16", self.dtype == torch.float16),
+            bf16=training_cfg.get("bf16", self.dtype == torch.bfloat16),
+            max_grad_norm=training_cfg.get("max_grad_norm", 1.0),
             gradient_checkpointing=True,
             optim="adamw_torch_fused",
             max_seq_length=max_len,
@@ -216,8 +216,6 @@ def train_single_selector(
 ) -> DistillationTrainer:
     """
     Convenience function to train a single selector dataset.
-    
-    ~35 min/run on one T4 for 500 examples × 3 epochs at 1.5B
     """
     import json
     

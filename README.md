@@ -4,7 +4,7 @@
 
 ## Overview
 
-This project implements a causal selection framework for knowledge distillation from multi-agent debate traces. Unlike random or confidence-based selection, we use counterfactual analysis to estimate the **causal utility** of each message - the expected improvement in student model performance if that message is included in training.
+This project implements a causal selection framework for knowledge distillation from multi-agent debate traces. Unlike random or confidence-based selection, we use counterfactual analysis to estimate the **causal utility** of each message - change in teacher-verifier correctness after deleting one message while holding all other transcript messages fixed
 
 ## Key Innovation
 

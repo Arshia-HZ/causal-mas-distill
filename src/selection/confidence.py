@@ -32,44 +32,45 @@ class ConfidenceSelector(Selector):
     def select(
         self,
         traces: list[Any],
-        utilities: dict[str, float],
+        utilities: dict[tuple[str, str], float],
         token_budget: int,
-    ) -> list[str]:
+    ) -> dict[str, list[str]]:
         """
         Select messages based on confidence scores.
 
         Args:
             traces: List of debate traces.
-            utilities: Dictionary mapping message IDs to utility scores.
+            utilities: Dictionary mapping (trace_id, mid) to utility scores.
                        For this selector, utilities represent confidence.
             token_budget: Maximum tokens allowed.
 
         Returns:
-            List of selected message IDs.
+            Dictionary mapping trace_id to list of selected message IDs.
         """
         # Filter and sort by confidence (stored as utility)
         candidates = []
         for trace in traces:
+            trace_id = getattr(trace, "trace_id", getattr(trace, "pid", ""))
             for msg in trace.messages:
-                confidence = utilities.get(msg.mid, 0.0)
+                confidence = utilities.get((trace_id, msg.mid), 0.0)
                 if confidence >= self.min_confidence:
-                    tokens = self._estimate_tokens(msg.content)
-                    candidates.append((msg.mid, confidence, tokens))
+                    tokens = self._estimate_tokens(msg.text)
+                    candidates.append((trace_id, msg.mid, confidence, tokens))
 
         # Sort by confidence descending
-        candidates.sort(key=lambda x: x[1], reverse=True)
+        candidates.sort(key=lambda x: x[2], reverse=True)
 
         # Apply top_k if set
         if self.top_k is not None:
             candidates = candidates[: self.top_k]
 
         # Select within token budget
-        selected = []
+        selected = {}
         total_tokens = 0
 
-        for mid, confidence, tokens in candidates:
+        for trace_id, mid, confidence, tokens in candidates:
             if total_tokens + tokens <= token_budget:
-                selected.append(mid)
+                selected.setdefault(trace_id, []).append(mid)
                 total_tokens += tokens
 
         return selected

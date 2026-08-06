@@ -13,12 +13,13 @@ class Backend(Protocol):
     """Protocol defining the backend interface."""
 
     @abstractmethod
-    def generate(
+    async def generate(
         self,
         messages: list[dict],
         n: int = 1,
-        temperature: float = 1.0,
+        temperature: float = 0.7,
         max_tokens: int | None = None,
+        cache_nonce: str | None = None,
     ) -> list[str]:
         """
         Generate completions for the given messages.

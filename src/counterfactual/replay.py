@@ -1,219 +1,228 @@
 """
-Counterfactual replay for causal utility estimation.
+Counterfactual replay -- direct effect (fixed-context) estimator.
 
-Core function: message_utility()
-- Ablates a message from the debate
-- Regenerates all topologically downstream messages
-- Computes utility as the change in outcome probability
+Estimand
+--------
+For message m in a debate trace, the DIRECT effect is:
+
+    delta(m) = P(final answer correct | full transcript)
+             - P(final answer correct | transcript minus m)
+
+Intermediate messages are held FIXED; only the terminal answer is regenerated.
+Cost is k generations per condition instead of k * |descendants|.
+
+Sign convention: delta > 0 means the message HELPED. Selectors must rank by
+descending delta.
+
+Requirement on the harness: the terminal node must condition on the whole
+transcript, otherwise the direct effect of non-parent messages is trivially 0.
+`assert_terminal_sees_all` enforces this.
 """
 
-import asyncio
-import re
-from typing import Any
+from __future__ import annotations
 
-from ..debate.schema import Trace, Message, descendants
+import math
+from dataclasses import dataclass, asdict
+from typing import Any, Iterable, Sequence
 
+from ..debate.schema import Trace, Message
 
-def extract_answer(text: str) -> str | None:
-    """Extract answer from text using common patterns."""
-    # Try to find answer after "Answer:" or "The answer is"
-    patterns = [
-        r"(?:The )?answer(?:\s+is)?:?\s*(.+)",
-        r"####\s*(.+)",
-        r"\$\$?\s*(.+?)\s*\$\$?$",
-        r"\(([^)]+)\)$",  # Answer in parentheses at end
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, text.strip(), re.IGNORECASE | re.MULTILINE)
-        if match:
-            return match.group(1).strip()
-    
-    return None
+try:
+    from eval.grade import is_correct
+except ImportError:  # allow running as a plain package
+    import sys
+    from pathlib import Path
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from eval.grade import is_correct
 
 
-def is_correct(pred: str, gold: str) -> bool:
+FINAL_INSTRUCTION = (
+    "You are the verifier. Read the discussion above and state the single "
+    "final answer to the question. Put the final answer in \\boxed{}."
+)
+
+
+@dataclass
+class Utility:
+    pid: str
+    trace_id: str
+    mid: str
+    role: str
+    round: int
+    delta: float
+    p_factual: float
+    p_ablated: float
+    k: int
+    se: float
+    estimand: str = "direct"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def terminal_mid(trace: Trace) -> str:
+    """Terminal node = the message no other message lists as a parent."""
+    if not trace.messages:
+        raise ValueError(f"trace {trace.pid} has no messages")
+    parented = {p for m in trace.messages for p in m.parents}
+    sinks = [m.mid for m in trace.messages if m.mid not in parented]
+    if len(sinks) == 1:
+        return sinks[0]
+    # fall back to latest round, then last in insertion order
+    return max(trace.messages, key=lambda m: (m.round, trace.messages.index(m))).mid
+
+
+def assert_terminal_sees_all(trace: Trace) -> None:
     """
-    Check if prediction is correct using math-verify if available.
-    
-    Falls back to simple string matching.
+    Guard the estimand. If the terminal node does not condition on every other
+    message, direct effects are structurally zero for the unseen ones and the
+    experiment is meaningless.
     """
-    # Normalize
-    pred_norm = pred.strip().lower()
-    gold_norm = gold.strip().lower()
-    
-    if pred_norm == gold_norm:
-        return True
-    
-    # Try math-verify
-    try:
-        from math_verify import parse, verify
-        return verify(parse(gold), parse(pred))
-    except ImportError:
-        pass
-    
-    return False
+    t = terminal_mid(trace)
+    term = trace.get_message(t)
+    assert term is not None
+    seen = set(term.parents)
+    everything = {m.mid for m in trace.messages if m.mid != t}
+    missing = everything - seen
+    if missing:
+        raise AssertionError(
+            f"trace {trace.pid}: terminal node {t} does not see {sorted(missing)}. "
+            "Direct effect is undefined for those messages. Fix the harness so the "
+            "terminal node conditions on the full transcript."
+        )
 
 
-def build_prompt(trace: Trace, node: str, ctx: dict[str, Message]) -> list[dict]:
+def assert_parents_invariant(trace: Trace, prompt_of=None) -> None:
     """
-    Build prompt for regenerating a message with ablated context.
-    
-    Args:
-        trace: Original trace.
-        node: Node ID to regenerate.
-        ctx: Context with ablated message removed.
-        
-    Returns:
-        List of message dicts for API call.
+    Ablation is only valid if `parents` exactly describes what was rendered
+    into the prompt: every declared parent present, every non-parent absent.
     """
-    msg = trace.get_message(node)
-    if msg is None:
-        raise ValueError(f"Unknown node: {node}")
-    
-    messages = []
-    
-    # System prompt
-    messages.append({
-        "role": "system",
-        "content": f"You are a {msg.role}. Provide a response to the question."
-    })
-    
-    # User: problem
-    messages.append({
-        "role": "user",
-        "content": trace.question
-    })
-    
-    # Add context messages (excluding ablated message and its downstream)
+    index = {m.mid: m for m in trace.messages}
+
     for m in trace.messages:
-        if m.mid in ctx:
-            role = "assistant" if m.role in ("solver", "critic", "verifier") else "user"
-            messages.append({
-                "role": role,
-                "content": m.text
-            })
-    
-    return messages
+        for p in m.parents:
+            if p not in index:
+                raise AssertionError(
+                    f"{trace.pid}/{m.mid}: declared parent {p} does not exist"
+                )
+
+    # Note: this check might need adjustment if intermediate nodes have different prompts.
+    # For now, it's mainly checking the verifier if we default to render_verifier_messages.
 
 
-def final_answer_of(ctx: dict[str, Message]) -> str | None:
-    """Get final answer from context."""
-    # Find last message with an answer
-    for mid in sorted(ctx.keys(), reverse=True):
-        msg = ctx[mid]
-        if msg.answer:
-            return msg.answer
-    return None
-
-
-def replace(msg: Message, **kwargs) -> Message:
-    """Create a new Message with updated fields."""
-    return Message(
-        mid=msg.mid,
-        round=kwargs.get("round", msg.round),
-        role=kwargs.get("role", msg.role),
-        text=kwargs.get("text", msg.text),
-        answer=kwargs.get("answer", msg.answer),
-        parents=kwargs.get("parents", msg.parents),
-    )
-
-
-async def message_utility(
+def render_verifier_messages(
     trace: Trace,
-    mid: str,
+    exclude: Iterable[str] = (),
+) -> list[dict]:
+    """
+    Render the prompt for the verifier from all prior messages, minus `exclude`.
+    Parent order follows trace order so the transcript reads chronologically.
+    """
+    ex = set(exclude)
+    
+    out: list[dict] = [
+        {"role": "system", "content": "You are the verifier in a multi-agent debate."},
+        {"role": "user", "content": f"Question:\n{trace.question}"},
+    ]
+    for msg in trace.messages:
+        if msg.role == "verifier":
+            continue
+        if msg.mid in ex:
+            continue
+        out.append({"role": "user", "content": f"[{msg.role} | {msg.mid}]\n{msg.text}"})
+    
+    out.append({"role": "user", "content": FINAL_INSTRUCTION})
+    return out
+
+
+async def _p_correct(
+    trace: Trace,
+    exclude: Sequence[str],
     backend: Any,
-    k: int = 16,
-    temperature: float = 0.7
+    k: int,
+    temperature: float,
 ) -> float:
     """
-    Compute causal utility of a message via counterfactual replay.
-    
-    Args:
-        trace: Original debate trace.
-        mid: Message ID to ablate.
-        backend: API backend for generation.
-        k: Number of samples for estimation.
-        temperature: Sampling temperature.
-        
-    Returns:
-        Causal utility (Δ) as proportion correct improvement.
+    Accuracy of the regenerated terminal answer under a given context.
+
+    All k samples are requested in ONE call so a hash cache cannot collapse
+    them into k copies of a single draw.
     """
-    # Get downstream messages
-    downstream = descendants(trace, mid)
-    
-    correct = 0
-    for _ in range(k):
-        # Build context without the ablated message
-        ctx = {
-            m.mid: m for m in trace.messages
-            if m.mid != mid and m.mid not in downstream
-        }
-        
-        # Regenerate each downstream message in topological order
-        downstream_list = sorted(downstream)
-        for node_mid in downstream_list:
-            node_msg = trace.get_message(node_mid)
-            if node_msg is None:
-                continue
-                
-            msgs = build_prompt(trace, node_mid, ctx)
-            txt = (await backend.generate(msgs, n=1, temperature=temperature))[0]
-            ans = extract_answer(txt)
-            
-            ctx[node_mid] = replace(node_msg, text=txt, answer=ans)
-        
-        # Check if counterfactual is correct
-        final_ans = final_answer_of(ctx)
-        if final_ans and is_correct(final_ans, trace.gold):
-            correct += 1
-    
-    return correct / k
+    msgs = render_verifier_messages(trace, exclude=exclude)
+    samples = await backend.generate(msgs, n=k, temperature=temperature)
+    if len(samples) < k:
+        raise RuntimeError(
+            f"backend returned {len(samples)} samples for n={k}; "
+            "sample collapse would silently zero the variance"
+        )
+    hits = sum(1 for s in samples if is_correct(s, trace.gold))
+    return hits / k
 
 
-class CounterfactualReplay:
-    """Manager for counterfactual replay operations."""
-    
-    def __init__(self, backend: Any):
-        self.backend = backend
-    
-    async def replay_from(
-        self,
-        trace: Trace,
-        mid: str,
-        k: int = 16,
-        temperature: float = 0.7
-    ) -> Trace:
-        """
-        Replay a trace with a specific message ablated.
-        
-        Returns:
-            New trace with ablated message and regenerated downstream.
-        """
-        util = await message_utility(trace, mid, self.backend, k, temperature)
-        
-        # For now, just return the utility value
-        # Full trace reconstruction would require storing all intermediate states
-        return util
-    
-    async def compute_utilities(
-        self,
-        traces: list[Trace],
-        k: int = 16,
-        temperature: float = 0.7
-    ) -> dict[str, float]:
-        """
-        Compute utilities for all messages in traces.
-        
-        Returns:
-            Dict mapping mid to utility value.
-        """
-        utilities = {}
-        
-        for trace in traces:
-            for msg in trace.messages:
-                if msg.round > 0:  # Skip root message
-                    util = await message_utility(trace, msg.mid, self.backend, k, temperature)
-                    utilities[f"{trace.pid}:{msg.mid}"] = util
-        
-        return utilities
+async def trace_utilities(
+    trace: Trace,
+    backend: Any,
+    k: int = 16,
+    temperature: float = 0.7,
+    check_invariants: bool = True,
+) -> list[Utility]:
+    """
+    Direct-effect utility for every non-terminal message in one trace.
+
+    Cost: (1 + n_messages) * k generations, with the factual condition shared
+    across all messages in the trace.
+    """
+    if check_invariants:
+        assert_terminal_sees_all(trace)
+
+    term = terminal_mid(trace)
+    p_fact = await _p_correct(trace, (), backend, k, temperature)
+
+    results: list[Utility] = []
+    for m in trace.messages:
+        if m.mid == term:
+            continue
+        p_abl = await _p_correct(trace, (m.mid,), backend, k, temperature)
+        delta = p_fact - p_abl
+        se = math.sqrt(
+            max(p_fact * (1 - p_fact), 0.0) / k + max(p_abl * (1 - p_abl), 0.0) / k
+        )
+        results.append(
+            Utility(
+                pid=trace.pid,
+                trace_id=trace.trace_id,
+                mid=m.mid,
+                role=m.role,
+                round=m.round,
+                delta=delta,
+                p_factual=p_fact,
+                p_ablated=p_abl,
+                k=k,
+                se=se,
+            )
+        )
+    return results
+
+
+async def noise_floor(
+    trace: Trace,
+    backend: Any,
+    k: int = 16,
+    temperature: float = 0.7,
+    repeats: int = 2,
+) -> list[float]:
+    """
+    Placebo: re-estimate the UNABLATED condition `repeats` times and return the
+    pairwise differences. Their spread is the pure sampling-noise floor.
+
+    Requires a backend whose cache key includes a replicate index, otherwise
+    every repeat returns the identical value and tau collapses to exactly 0.
+    A tau of exactly 0.0 is proof of cache collapse, not of a clean estimator.
+    """
+    vals = []
+    for r in range(repeats):
+        msgs = render_verifier_messages(trace, exclude=())
+        # We use cache_nonce to differentiate replicates
+        samples = await backend.generate(msgs, n=k, temperature=temperature, cache_nonce=f"__replicate__:{r}")
+        vals.append(sum(1 for s in samples if is_correct(s, trace.gold)) / k)
+    return [vals[i] - vals[j] for i in range(len(vals)) for j in range(i + 1, len(vals))]

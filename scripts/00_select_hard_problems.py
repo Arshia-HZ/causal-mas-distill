@@ -25,7 +25,7 @@ def main():
     # Filter by difficulty
     selected = [
         item for item in data
-        if item.get("difficulty", 0) >= args.difficulty_threshold
+        if item.get("difficulty", 1.0) >= args.difficulty_threshold
     ][: args.max_problems]
 
     # Save selected problems

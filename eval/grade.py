@@ -1,93 +1,125 @@
 """
-Math grading using math-verify.
+Math answer extraction and grading.
 
-Provides accurate math answer verification.
+Hard requirements:
+- Never raise. A grader that throws kills an 8-hour unattended replay.
+- Handle \\boxed{...}, which is the dominant format in MATH/AIME.
+- Return False on unparseable input rather than accidentally matching.
 """
 
-from typing import Optional
+from __future__ import annotations
+
+import re
+
+_BOXED = re.compile(r"\\boxed\s*\{")
+_ANSWER_IS = re.compile(
+    r"(?:final\s+answer|answer)\s*(?:is)?\s*[:=]?\s*\$?\\?\(?\s*([^\n$]+)",
+    re.IGNORECASE,
+)
+_HASHES = re.compile(r"####\s*(.+)")
 
 
-def is_correct(pred: str, gold: str) -> bool:
+def extract_boxed(text: str) -> str | None:
+    """Extract the LAST \\boxed{...} with correct brace matching."""
+    if not text:
+        return None
+    last = None
+    for m in _BOXED.finditer(text):
+        i = m.end()  # just after the opening brace
+        depth = 1
+        buf = []
+        while i < len(text) and depth > 0:
+            ch = text[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            buf.append(ch)
+            i += 1
+        if depth == 0:
+            last = "".join(buf).strip()
+    return last
+
+
+def extract_answer(text: str) -> str | None:
     """
-    Check if prediction is correct using math-verify.
-    
-    Falls back to simple string matching if math-verify unavailable.
-    
-    Args:
-        pred: Predicted answer.
-        gold: Ground truth answer.
-        
-    Returns:
-        True if prediction matches gold.
+    Extract a final answer. Priority: \\boxed{} > #### > 'answer is'.
+
+    Returns None when nothing is found. Never raises.
     """
-    # Normalize for basic comparison
-    pred_norm = pred.strip().lower()
-    gold_norm = gold.strip().lower()
-    
-    if pred_norm == gold_norm:
-        return True
-    
-    # Try math-verify
+    if not text:
+        return None
     try:
-        from math_verify import parse, verify
-        return verify(parse(gold), parse(pred))
-    except ImportError:
-        pass
-    
-    return False
+        b = extract_boxed(text)
+        if b:
+            return b
+        m = _HASHES.search(text)
+        if m:
+            return m.group(1).strip()
+        # take the LAST 'answer is' occurrence, not the first
+        matches = list(_ANSWER_IS.finditer(text))
+        if matches:
+            return matches[-1].group(1).strip().rstrip(".,;:").strip()
+    except Exception:
+        return None
+    return None
 
 
-def grade_batch(
-    predictions: list[str],
-    gold_answers: list[str],
-) -> list[bool]:
-    """
-    Grade a batch of predictions.
-    
-    Args:
-        predictions: List of predicted answers.
-        gold_answers: List of ground truth answers.
-        
-    Returns:
-        List of boolean correctness values.
-    """
-    return [is_correct(p, g) for p, g in zip(predictions, gold_answers)]
+def _normalize(s: str) -> str:
+    """Conservative normalisation for the no-math_verify fallback path."""
+    s = s.strip().rstrip(".").strip()
+    s = s.replace("\\!", "").replace("\\,", "").replace("\\ ", "")
+    s = s.replace("$", "").replace("\\%", "").replace("%", "")
+    s = s.replace("\\left", "").replace("\\right", "")
+    s = s.replace(" ", "")
+    s = re.sub(r"^\\text\{(.*)\}$", r"\1", s)
+    s = re.sub(r"(?<=\d),(?=\d{3}\b)", "", s)  # thousands separators
+    s = s.lower()
+    if re.fullmatch(r"-?\d+\.0+", s):
+        s = s.split(".")[0]
+    return s
 
 
-def accuracy(predictions: list[str], gold_answers: list[str]) -> float:
+def is_correct(pred: str | None, gold: str | None) -> bool:
     """
-    Compute accuracy for a batch of predictions.
-    
-    Args:
-        predictions: List of predicted answers.
-        gold_answers: List of ground truth answers.
-        
-    Returns:
-        Accuracy as a float between 0 and 1.
+    Grade one prediction. Never raises; returns False on any failure.
+
+    `pred` may be either a raw generation or an already-extracted answer.
     """
-    if len(predictions) != len(gold_answers):
-        raise ValueError("predictions and gold_answers must have same length")
-    
-    if len(predictions) == 0:
+    if pred is None or gold is None:
+        return False
+    try:
+        cand = extract_answer(pred) or pred
+        try:
+            from math_verify import parse, verify  # type: ignore
+
+            return bool(verify(parse(str(gold)), parse(str(cand))))
+        except ImportError:
+            pass
+        except Exception:
+            pass  # fall through to string comparison
+        return _normalize(str(cand)) == _normalize(str(gold))
+    except Exception:
+        return False
+
+
+def grade_batch(preds: list[str], golds: list[str]) -> list[bool]:
+    return [is_correct(p, g) for p, g in zip(preds, golds)]
+
+
+def accuracy(preds: list[str], golds: list[str]) -> float:
+    if len(preds) != len(golds):
+        raise ValueError("preds and golds must have equal length")
+    if not preds:
         return 0.0
-    
-    results = grade_batch(predictions, gold_answers)
-    return sum(results) / len(results)
+    r = grade_batch(preds, golds)
+    return sum(r) / len(r)
 
 
-if __name__ == "__main__":
-    # Test cases
-    test_cases = [
-        ("42", "42", True),
-        ("42", "41", False),
-        ("x = 42", "42", True),
-        ("The answer is 42.", "42", True),
-        ("3.14", "3.14", True),
-        ("1/2", "0.5", True),
-    ]
-    
-    print("Testing is_correct:")
-    for pred, gold, expected in test_cases:
-        result = is_correct(pred, gold)
-        status = "✓" if result == expected else "✗"
-        print(f"  {status} is_correct({pred!r}, {gold!r}) = {result} (expected {expected})")
+# Back-compat alias: eval/run_eval.py imports this name.
+def compute_accuracy(results: list[bool]) -> float:
+    if not results:
+        return 0.0
+    return sum(bool(r) for r in results) / len(results)

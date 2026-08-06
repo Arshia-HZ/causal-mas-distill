@@ -20,19 +20,19 @@ class Selector(ABC):
     def select(
         self,
         traces: list[Any],
-        utilities: dict[str, float],
+        utilities: dict[tuple[str, str], float],
         token_budget: int,
-    ) -> list[str]:
+    ) -> dict[str, list[str]]:
         """
         Select message IDs for training based on utilities and budget.
 
         Args:
             traces: List of debate traces.
-            utilities: Dictionary mapping message IDs to utility scores.
+            utilities: Dictionary mapping (trace_id, mid) to utility scores.
             token_budget: Maximum tokens allowed for selected messages.
 
         Returns:
-            List of selected message IDs.
+            Dictionary mapping trace_id to list of selected message IDs.
         """
         ...
 

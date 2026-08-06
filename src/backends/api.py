@@ -34,18 +34,23 @@ class ApiBackend:
         self,
         model: str,
         base_url: str,
-        api_key_env: str,
-        cache_path: str,
+        api_key_env: str = None,
+        api_key: str = None,
+        cache_path: str = "cache.jsonl",
         concurrency: int = 24,
         max_tokens: int = 768,
         supports_n: bool = True,
+        extra_body: dict | None = None,
     ):
         self.model = model
         self.max_tokens = max_tokens
         self.supports_n = supports_n
+        self.extra_body = extra_body or {}
+        
+        actual_key = api_key or (os.environ[api_key_env] if api_key_env else os.environ.get("OPENAI_API_KEY", ""))
         
         self.client = AsyncOpenAI(
-            api_key=os.environ[api_key_env],
+            api_key=actual_key,
             base_url=base_url
         )
         
@@ -67,7 +72,7 @@ class ApiBackend:
         
         self.fh = self.p.open("a")
 
-    async def _one(self, messages, n: int, temperature: float):
+    async def _one(self, messages, n: int, temperature: float, max_tokens: int):
         """Single generation attempt with retry logic."""
         for attempt in range(6):
             try:
@@ -77,7 +82,8 @@ class ApiBackend:
                         messages=messages,
                         n=n,
                         temperature=temperature,
-                        max_tokens=self.max_tokens
+                        max_tokens=max_tokens,
+                        extra_body=self.extra_body,
                     )
                     return [c.message.content for c in r.choices]
                 
@@ -88,7 +94,8 @@ class ApiBackend:
                         messages=messages,
                         n=1,
                         temperature=temperature,
-                        max_tokens=self.max_tokens
+                        max_tokens=max_tokens,
+                        extra_body=self.extra_body,
                     )
                     for _ in range(n)
                 ])
@@ -103,7 +110,9 @@ class ApiBackend:
         self,
         messages: list[dict],
         n: int = 1,
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        max_tokens: int | None = None,
+        cache_nonce: str | None = None,
     ) -> list[str]:
         """
         Generate completions with caching.
@@ -112,17 +121,20 @@ class ApiBackend:
             messages: Chat messages.
             n: Number of samples.
             temperature: Sampling temperature.
+            max_tokens: Maximum generated tokens.
+            cache_nonce: Optional string to differentiate cache keys.
             
         Returns:
             List of generated text completions.
         """
-        k = key_of({"m": messages, "n": n, "t": temperature, "mo": self.model})
+        mt = max_tokens or self.max_tokens
+        k = key_of({"m": messages, "n": n, "t": temperature, "mt": mt, "mo": self.model, "c": cache_nonce})
         
         if k in self.cache:
             return self.cache[k]
         
         async with self.sem:
-            out = await self._one(messages, n, temperature)
+            out = await self._one(messages, n, temperature, mt)
         
         async with self.lock:
             self.cache[k] = out

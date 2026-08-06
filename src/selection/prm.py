@@ -32,40 +32,41 @@ class PRMSelector(Selector):
     def select(
         self,
         traces: list[Any],
-        utilities: dict[str, float],
+        utilities: dict[tuple[str, str], float],
         token_budget: int,
-    ) -> list[str]:
+    ) -> dict[str, list[str]]:
         """
         Select messages based on PRM scores.
 
         Args:
             traces: List of debate traces.
-            utilities: Dictionary mapping message IDs to utility scores.
+            utilities: Dictionary mapping (trace_id, mid) to utility scores.
                        For this selector, utilities represent PRM scores.
             token_budget: Maximum tokens allowed.
 
         Returns:
-            List of selected message IDs.
+            Dictionary mapping trace_id to list of selected message IDs.
         """
         # Filter and sort by PRM score
         candidates = []
         for trace in traces:
+            trace_id = getattr(trace, "trace_id", getattr(trace, "pid", ""))
             for msg in trace.messages:
-                score = utilities.get(msg.mid, 0.0)
+                score = utilities.get((trace_id, msg.mid), 0.0)
                 if score >= self.min_score:
-                    tokens = self._estimate_tokens(msg.content)
-                    candidates.append((msg.mid, score, tokens))
+                    tokens = self._estimate_tokens(msg.text)
+                    candidates.append((trace_id, msg.mid, score, tokens))
 
         # Sort by PRM score descending
-        candidates.sort(key=lambda x: x[1], reverse=True)
+        candidates.sort(key=lambda x: x[2], reverse=True)
 
         # Select within token budget
-        selected = []
+        selected = {}
         total_tokens = 0
 
-        for mid, score, tokens in candidates:
+        for trace_id, mid, score, tokens in candidates:
             if total_tokens + tokens <= token_budget:
-                selected.append(mid)
+                selected.setdefault(trace_id, []).append(mid)
                 total_tokens += tokens
 
         return selected

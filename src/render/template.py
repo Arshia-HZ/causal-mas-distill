@@ -1,132 +1,106 @@
 """
-Unified template renderer for all selectors.
+Unified template renderer.
 
-Every selector goes through this template. No exceptions.
-This eliminates the format confound structurally.
+Every selector renders through this one template so that output FORMAT is
+held constant and the only thing that varies across arms is WHICH messages
+were selected. That is the format control for the whole experiment.
+
+Two correctness requirements:
+- Never use str.format on content containing LaTeX. `{\\frac{1}{2}}` raises
+  KeyError/IndexError. Build by concatenation.
+- The supervised target is the TEACHER's final answer, not the gold label.
+  Training on gold turns every arm into answer-only SFT and erases the
+  contrast you are trying to measure.
 """
 
-from ..debate.schema import Trace, Message
+from __future__ import annotations
 
+from ..debate.schema import Trace
 
-# Universal skeleton template - one template for ALL selectors
-SKEL = """Question: {q}
+SLOTS = ("hypothesis", "disagreement", "error", "correction", "verify", "action")
 
-<hypothesis>{hypothesis}</hypothesis>
-<disagreement>{disagreement}</disagreement>
-<error>{error}</error>
-<correction>{correction}</correction>
-<verify>{verify}</verify>
-<action>{action}</action>
-
-Answer: {answer}"""
+# Role x position -> slot. Explicit, and independent of round numbering.
+_ROLE_SLOT = {
+    ("solver", 1): "hypothesis",
+    ("critic", 1): "disagreement",
+    ("solver", 2): "error",
+    ("critic", 2): "correction",
+    ("verifier", 1): "verify",
+    ("verifier", 2): "verify",
+    ("solver", 3): "action",
+}
 
 
 def assign_slots(trace: Trace, selected_mids: list[str]) -> dict[str, str]:
-    """
-    Assign selected messages to slots in the template.
-    
-    Slots: hypothesis, disagreement, error, correction, verify, action
-    
-    Role-to-slot mapping for solver_critic_verifier topology:
-    - solver.hypothesis -> hypothesis
-    - critic.disagreement -> disagreement
-    - solver.error -> error
-    - critic.correction -> correction
-    - verifier.verify -> verify
-    - solver.action -> action
-    
-    Args:
-        trace: Debate trace.
-        selected_mids: List of message IDs to include.
-        
-    Returns:
-        Dict mapping slot names to content (empty string if unfilled).
-    """
-    # Default empty slots
-    slots = {
-        "hypothesis": "",
-        "disagreement": "",
-        "error": "",
-        "correction": "",
-        "verify": "",
-        "action": "",
-        "q": trace.question,
-        "answer": trace.gold,
-    }
-    
-    # Build message lookup
-    mid_to_msg = {m.mid: m for m in trace.messages}
-    
-    for mid in selected_mids:
-        msg = mid_to_msg.get(mid)
-        if msg is None:
+    """Map selected messages into named slots. Unselected slots stay empty."""
+    slots = {s: "" for s in SLOTS}
+    index = {m.mid: m for m in trace.messages}
+    order = {m.mid: i for i, m in enumerate(trace.messages)}
+    for mid in sorted(set(selected_mids), key=lambda x: order.get(x, 10**9)):
+        m = index.get(mid)
+        if m is None:
             continue
-            
-        # Map role+round to slot
-        if msg.role == "solver":
-            if msg.round == 1:
-                slots["hypothesis"] = msg.text
-            elif msg.round == 2:
-                slots["error"] = msg.text
-            elif msg.round == 3:
-                slots["action"] = msg.text
-        elif msg.role == "critic":
-            if msg.round == 1:
-                slots["disagreement"] = msg.text
-            elif msg.round == 2:
-                slots["correction"] = msg.text
-        elif msg.role == "verifier":
-            slots["verify"] = msg.text
-    
+        slot = _ROLE_SLOT.get((m.role, m.round))
+        if slot is None:
+            slot = "verify" if m.role == "verifier" else "action"
+        slots[slot] = (slots[slot] + "\n" + m.text).strip() if slots[slot] else m.text
     return slots
 
 
-def render(trace: Trace, selected_mids: list[str]) -> str:
+def render(trace: Trace, selected_mids: list[str], target: str | None = None) -> str:
     """
-    Render a trace into the unified template format.
-    
-    Args:
-        trace: Debate trace.
-        selected_mids: List of message IDs to include.
-        
-    Returns:
-        Formatted string using the universal skeleton.
+    Render one training example. Concatenation only -- no str.format.
+
+    `target` defaults to the teacher's final answer. Pass gold explicitly only
+    for an oracle arm, and label that arm as such.
     """
     slots = assign_slots(trace, selected_mids)
-    return SKEL.format(**slots)
+    answer = target if target is not None else (trace.final_answer or "")
+    parts = ["Question: ", trace.question, "\n\n"]
+    for s in SLOTS:
+        parts.append("<" + s + ">" + slots[s] + "</" + s + ">\n")
+    parts.append("\nAnswer: ")
+    parts.append(answer)
+    return "".join(parts)
 
 
-def render_batch(traces: list[Trace], selected_mids_list: list[list[str]]) -> list[str]:
+def render_for_sft(
+    traces: list[Trace],
+    selected_by_trace_id: dict[str, list[str]],
+) -> list[dict]:
     """
-    Render multiple traces.
-    
-    Args:
-        traces: List of debate traces.
-        selected_mids_list: List of message ID lists (one per trace).
-        
-    Returns:
-        List of formatted strings.
+    Build SFT records. One record per trace, NOT one per message.
+
+    `selected_by_trace_id` maps trace_id -> selected mids for that trace, so selection is
+    per-trace and every arm yields the same number of examples.
     """
-    return [render(t, mids) for t, mids in zip(traces, selected_mids_list)]
+    out = []
+    for t in traces:
+        trace_id = getattr(t, "trace_id", getattr(t, "pid", ""))
+        mids = selected_by_trace_id.get(trace_id, [])
+        text = render(t, mids)
+        prompt, _, completion = text.rpartition("\nAnswer: ")
+        out.append(
+            {
+                "pid": t.pid,
+                "trace_id": trace_id,
+                "text": text,
+                "prompt": prompt + "\nAnswer:",
+                "completion": " " + completion,
+                "n_selected": len(mids),
+                "gold": t.gold,
+            }
+        )
+    return out
 
 
 class TemplateRenderer:
-    """Template renderer with caching for efficiency."""
-    
-    def __init__(self):
-        self._cache = {}
-    
-    def render(self, trace: Trace, selected_mids: list[str]) -> str:
-        """Render with optional caching."""
-        cache_key = f"{trace.pid}:{','.join(sorted(selected_mids))}"
-        
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        
-        result = render(trace, selected_mids)
-        self._cache[cache_key] = result
-        return result
-    
-    def clear_cache(self):
-        """Clear the render cache."""
-        self._cache.clear()
+    """Thin OO wrapper kept for back-compat with scripts/03_build_datasets.py."""
+
+    @staticmethod
+    def render_for_sft(traces, selected_by_trace_id):
+        return render_for_sft(traces, selected_by_trace_id)
+
+    @staticmethod
+    def render(trace, selected_mids, target=None):
+        return render(trace, selected_mids, target)

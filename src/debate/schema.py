@@ -62,6 +62,7 @@ class Trace:
     
     Attributes:
         pid: Problem ID.
+        trace_id: Unique identifier for this trace (e.g. pid:s0).
         question: The problem statement.
         gold: Ground truth answer.
         messages: List of messages in the debate (in order).
@@ -70,6 +71,7 @@ class Trace:
         topology: Topology type (e.g., "solver_critic_verifier").
     """
     pid: str
+    trace_id: str
     question: str
     gold: str
     messages: list[Message] = field(default_factory=list)
@@ -96,6 +98,7 @@ class Trace:
         """Convert to dictionary for serialization."""
         return {
             "pid": self.pid,
+            "trace_id": self.trace_id,
             "question": self.question,
             "gold": self.gold,
             "messages": [m.to_dict() for m in self.messages],
@@ -109,6 +112,7 @@ class Trace:
         """Create from dictionary."""
         return cls(
             pid=d["pid"],
+            trace_id=d.get("trace_id", d["pid"]),  # fallback for old data
             question=d["question"],
             gold=d["gold"],
             messages=[Message.from_dict(m) for m in d.get("messages", [])],
@@ -144,11 +148,12 @@ def descendants(trace: Trace, mid: str) -> set[str]:
     return downstream
 
 
-def topo_order(mids: set[str]) -> list[str]:
+def topo_order(trace: Trace, mids: set[str]) -> list[str]:
     """
     Topological sort of message IDs based on parent relationships.
     
-    Note: This requires the trace context for actual parent info.
-    This is a placeholder that returns sorted order.
+    Since trace.messages is topologically sorted by construction,
+    we can just sort based on their index in the trace.
     """
-    return sorted(mids)
+    order = {m.mid: i for i, m in enumerate(trace.messages)}
+    return sorted(mids, key=lambda mid: order.get(mid, float("inf")))

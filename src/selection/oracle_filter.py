@@ -31,33 +31,34 @@ class OracleFilterSelector(Selector):
     def select(
         self,
         traces: list[Any],
-        utilities: dict[str, float],
+        utilities: dict[tuple[str, str], float],
         token_budget: int,
-    ) -> list[str]:
+    ) -> dict[str, list[str]]:
         """
         Select messages using oracle information.
 
         Args:
             traces: List of debate traces.
-            utilities: Dictionary mapping message IDs to utility scores.
+            utilities: Dictionary mapping (trace_id, mid) to utility scores.
             token_budget: Maximum tokens allowed.
 
         Returns:
-            List of selected message IDs.
+            Dictionary mapping trace_id to list of selected message IDs.
         """
         # Filter traces by correctness if needed
         if self.correct_traces_only:
             traces = [t for t in traces if self._is_correct(t)]
 
         # Select all messages from correct traces within budget
-        selected = []
+        selected = {}
         total_tokens = 0
 
         for trace in traces:
+            trace_id = getattr(trace, "trace_id", getattr(trace, "pid", ""))
             for msg in trace.messages:
-                tokens = self._estimate_tokens(msg.content)
+                tokens = self._estimate_tokens(msg.text)
                 if total_tokens + tokens <= token_budget:
-                    selected.append(msg.mid)
+                    selected.setdefault(trace_id, []).append(msg.mid)
                     total_tokens += tokens
 
         return selected
@@ -66,18 +67,10 @@ class OracleFilterSelector(Selector):
         """
         Check if a trace leads to the correct answer.
 
-        This requires ground truth information, which would
-        typically be provided through the trace metadata.
-
         Args:
             trace: Debate trace to check.
 
         Returns:
             True if the trace leads to a correct answer.
         """
-        # Check metadata for correctness flag
-        if hasattr(trace, "metadata") and trace.metadata.get("is_correct"):
-            return True
-
-        # Default: assume not correct (oracle information needed)
-        return False
+        return trace.final_correct
