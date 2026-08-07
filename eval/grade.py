@@ -73,6 +73,12 @@ def _normalize(s: str) -> str:
     s = s.replace("\\!", "").replace("\\,", "").replace("\\ ", "")
     s = s.replace("$", "").replace("\\%", "").replace("%", "")
     s = s.replace("\\left", "").replace("\\right", "")
+    # \dfrac / \tfrac are just display variants of \frac
+    s = s.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
+    # unify \sqrt5 / \sqrt 5 -> \sqrt{5} (single-digit argument only)
+    s = re.sub(r"\\sqrt\s*(\d)", r"\\sqrt{\1}", s)
+    # unify \frac43 -> \frac{4}{3} (two single-digit unbraced arguments)
+    s = re.sub(r"\\frac\s*(\d)\s*(\d)", r"\\frac{\1}{\2}", s)
     s = s.replace(" ", "")
     s = re.sub(r"^\\text\{(.*)\}$", r"\1", s)
     s = re.sub(r"(?<=\d),(?=\d{3}\b)", "", s)  # thousands separators
@@ -95,7 +101,8 @@ def is_correct(pred: str | None, gold: str | None) -> bool:
         try:
             from math_verify import parse, verify  # type: ignore
 
-            return bool(verify(parse(str(gold)), parse(str(cand))))
+            if bool(verify(parse(str(gold)), parse(str(cand)))):
+                return True
         except ImportError:
             pass
         except Exception:

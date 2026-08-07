@@ -49,7 +49,7 @@ def main():
         api_key=args.api_key,
         model=args.model,
         cache_path=args.cache_path,
-        supports_n=False,  # DeepSeek chat API has no n parameter
+        supports_n=True,
         extra_body={"thinking": {"type": "disabled"}},  # hidden CoT breaks ablation
     )
 
