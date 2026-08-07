@@ -18,22 +18,39 @@ from src.debate.prompts import get_solve_prompt
 from eval.grade import is_correct
 
 
-async def probe(problems, backend, k, temperature):
+async def probe(problems, backend, k, temperature, log_every=25):
     sem = asyncio.Semaphore(16)
 
+    done = 0
+    total = len(problems)
+    rates = []
+
     async def one(p):
+        nonlocal done
         async with sem:
-            msgs = [{"role": "user", "content": get_solve_prompt(p["question"])}]
-            samples = await backend.generate(msgs, n=k, temperature=temperature)
-            hits = sum(1 for s in samples if is_correct(s, p["gold"]))
-            p["pass_rate"] = hits / len(samples) if samples else 0.0
+            try:
+                msgs = [{"role": "user", "content": get_solve_prompt(p["question"])}]
+                samples = await backend.generate(msgs, n=k, temperature=temperature)
+                hits = sum(1 for s in samples if is_correct(s, p["gold"]))
+                p["pass_rate"] = hits / len(samples) if samples else 0.0
+                rates.append(p["pass_rate"])
+            except Exception as e:
+                p["pass_rate"] = None
+                p["error"] = type(e).name
+            done += 1
+            if done % log_every == 0 or done == total:
+                mid = sum(1 for r in rates if 0.0 < r < 1.0)
+                failed = done - len(rates)
+                print(f"  probed {done}/{total} | headroom so far: {mid} | failed: {failed}",
+                flush=True)
             return p
 
     return await asyncio.gather(*[one(dict(p)) for p in problems])
 
 
 def keep(p, lo, hi):
-    return lo <= p["pass_rate"] <= hi
+    r = p.get("pass_rate")
+    return r is not None and lo <= r <= hi
 
 
 def main():
@@ -47,6 +64,7 @@ def main():
     ap.add_argument("--keep-min", type=float, default=0.1)
     ap.add_argument("--keep-max", type=float, default=0.9)
     ap.add_argument("--max-problems", type=int, default=100)
+    ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--cache-path", default="cache_probe.jsonl")
     args = ap.parse_args()
 
@@ -56,27 +74,27 @@ def main():
         api_key=args.api_key,
         model=args.model,
         cache_path=args.cache_path,
+        supports_n=True,
+        extra_body={"thinking": {"type": "disabled"}},
     )
-    out = asyncio.run(probe(problems, backend, args.k, 0.7))
+    out = asyncio.run(probe(problems, backend, args.k, 0.7, args.log_every))
 
+    valid = [p for p in out if p.get("pass_rate") is not None]
+    failed = [p for p in out if p.get("pass_rate") is None]
     dist = {"floor(0)": 0, "mid": 0, "ceiling(1)": 0}
-    for p in out:
-        dist[
-            "floor(0)"
-            if p["pass_rate"] == 0
-            else "ceiling(1)"
-            if p["pass_rate"] == 1
-            else "mid"
-        ] += 1
-    print(f"pass-rate distribution over {len(out)} problems: {dist}")
-
-    kept = [p for p in out if keep(p, args.keep_min, args.keep_max)]
-    kept.sort(key=lambda p: abs(p["pass_rate"] - 0.5))
+    for p in valid:
+        key = "floor(0)" if p["pass_rate"] == 0 else "ceiling(1)" if p["pass_rate"] == 1 else "mid"
+        dist[key] += 1
+    print(f"pass-rate distribution over {len(valid)} probed problems: {dist}")
+    if failed:
+        print(f"WARNING: {len(failed)} problems failed after retries and were excluded")
+    kept = [p for p in valid if keep(p, args.keep_min, args.keep_max)]
+    kept.sort(key=lambda p: abs(p["pass_rate"] - 0.5))  # closest to 0.5 first
     kept = kept[: args.max_problems]
-
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    json.dump(kept, open(out_path, "w"), indent=2)
+    with open(out_path, "w") as f:
+        json.dump(kept, f, indent=2)
     print(f"kept {len(kept)} -> {out_path}")
     print(f"first pass_rates: {[round(p['pass_rate'], 3) for p in kept[:20]]}")
 
