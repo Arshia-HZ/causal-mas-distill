@@ -66,6 +66,11 @@ def main():
     ap.add_argument("--max-problems", type=int, default=100)
     ap.add_argument("--log-every", type=int, default=25)
     ap.add_argument("--cache-path", default="cache_probe.jsonl")
+    ap.add_argument("--probed-out", default=None,
+                    help="Dump ALL probed problems with pass_rate here "
+                         "(default: <output_dir>/probed_all.json). The headroom "
+                         "audit needs the ceiling and floor problems too; "
+                         "writing only the kept ones discards them forever.")
     args = ap.parse_args()
 
     problems = json.load(open(args.input))
@@ -88,6 +93,33 @@ def main():
     print(f"pass-rate distribution over {len(valid)} probed problems: {dist}")
     if failed:
         print(f"WARNING: {len(failed)} problems failed after retries and were excluded")
+    # Persist EVERY probed problem. 00d_build_audit_pool.py needs the ceiling
+    # and floor strata to compute the headroom contrast. Writing only `kept`
+    # makes that information unrecoverable once the session dies.
+    probed_out = Path(args.probed_out) if args.probed_out else (
+        Path(args.output).parent / "probed_all.json"
+    )
+    probed_out.parent.mkdir(parents=True, exist_ok=True)
+    for q in valid:
+        r = q["pass_rate"]
+        q["stratum"] = "ceiling" if r >= 1.0 else "floor" if r <= 0.0 else "headroom"
+        q["n_samples"] = args.k
+    with open(probed_out, "w") as f:
+        json.dump(valid, f, indent=2)
+    print("wrote ALL " + str(len(valid)) + " probed problems -> " + str(probed_out))
+
+    # 'ceiling' means pass@k == 1.0, which is a statement about k as much as
+    # about the problem. At k=8 a problem whose true pass rate is 0.9 registers
+    # as ceiling 43% of the time, so headroom is UNDERCOUNTED. Raising k moves
+    # problems out of ceiling and into headroom, which is the pool you are
+    # short of.
+    if args.k < 16:
+        print("")
+        print("NOTE: k=" + str(args.k) + " is a coarse ruler. A problem with true")
+        print("pass rate 0.9 looks ceilinged " + format(0.9 ** args.k, ".0%") + " of the")
+        print("time at this k, so your headroom count is an UNDERCOUNT. If you")
+        print("are paying for the probe anyway, use --k 32.")
+
     kept = [p for p in valid if keep(p, args.keep_min, args.keep_max)]
     kept.sort(key=lambda p: abs(p["pass_rate"] - 0.5))  # closest to 0.5 first
     kept = kept[: args.max_problems]
