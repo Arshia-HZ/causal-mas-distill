@@ -181,12 +181,17 @@ class DebateHarness:
 
         async def _process(problem):
             nonlocal completed
-            traces = await self.run(
-                problem["pid"], 
-                problem["question"], 
-                problem["gold"], 
-                n_solutions_per_problem
-            )
+            try:
+                traces = await self.run(
+                    problem["pid"], 
+                    problem["question"], 
+                    problem["gold"], 
+                    n_solutions_per_problem
+                )
+            except Exception as e:
+                # One overflowing/failing problem must not kill the whole run.
+                print(f"  FAILED {problem['pid']}: {type(e).__name__}: {e}", flush=True)
+                traces = []
             completed += n_solutions_per_problem
             if progress_callback:
                 progress_callback(completed, total)

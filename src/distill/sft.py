@@ -11,10 +11,12 @@ import torch
 from pathlib import Path
 from typing import Optional, Union
 
+# DataCollatorForCompletionOnlyLM lives in trl, not transformers.
+# Importing it from transformers raises ImportError at training time.
+from trl import DataCollatorForCompletionOnlyLM
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorForCompletionOnlyLM,
 )
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer, SFTConfig

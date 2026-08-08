@@ -12,7 +12,7 @@ import os
 import random
 from pathlib import Path
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, BadRequestError
 
 
 def key_of(payload) -> str:
@@ -41,10 +41,15 @@ class ApiBackend:
         max_tokens: int = 768,
         supports_n: bool = True,
         extra_body: dict | None = None,
+        max_n_per_request: int = 8,
     ):
         self.model = model
         self.max_tokens = max_tokens
         self.supports_n = supports_n
+        # Providers cap `n` per request (yours caps it at 8). That is a
+        # PER-REQUEST cap, not a cap on k. generate() splits large k across
+        # several requests with distinct cache keys, so k=32/64 is available.
+        self.max_n_per_request = max(1, int(max_n_per_request))
         self.extra_body = extra_body or {}
         
         actual_key = api_key or (os.environ[api_key_env] if api_key_env else os.environ.get("OPENAI_API_KEY", ""))
@@ -101,6 +106,8 @@ class ApiBackend:
                 ])
                 return [o.choices[0].message.content for o in outs]
                 
+            except BadRequestError:
+                raise  # 400s (context overflow, bad params) never heal by retrying
             except Exception:
                 if attempt == 5:
                     raise
@@ -128,20 +135,41 @@ class ApiBackend:
             List of generated text completions.
         """
         mt = max_tokens or self.max_tokens
-        k = key_of({"m": messages, "n": n, "t": temperature, "mt": mt, "mo": self.model, "c": cache_nonce})
-        
-        if k in self.cache:
-            return self.cache[k]
-        
-        async with self.sem:
-            out = await self._one(messages, n, temperature, mt)
-        
-        async with self.lock:
-            self.cache[k] = out
-            self.fh.write(json.dumps({"k": k, "v": out}) + "\n")
-            self.fh.flush()
-        
-        return out
+
+        # Split n into provider-sized chunks. Each chunk gets its own cache
+        # key (the chunk index is part of the key) so replicates never
+        # collapse onto one cached draw, which would silently zero variance.
+        chunks = []
+        remaining = n
+        while remaining > 0:
+            take = min(remaining, self.max_n_per_request)
+            chunks.append(take)
+            remaining -= take
+
+        results: list[str] = []
+        for ci, take in enumerate(chunks):
+            if len(chunks) == 1:
+                nonce = cache_nonce
+            else:
+                nonce = (cache_nonce or '') + '|chunk' + str(ci)
+            key = key_of({"m": messages, "n": take, "t": temperature,
+                          "mt": mt, "mo": self.model, "c": nonce})
+
+            if key in self.cache:
+                results.extend(self.cache[key])
+                continue
+
+            async with self.sem:
+                out = await self._one(messages, take, temperature, mt)
+
+            async with self.lock:
+                self.cache[key] = out
+                self.fh.write(json.dumps({"k": key, "v": out}) + "\n")
+                self.fh.flush()
+
+            results.extend(out)
+
+        return results
 
     def close(self):
         """Close file handle."""

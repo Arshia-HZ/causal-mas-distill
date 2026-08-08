@@ -1,65 +1,72 @@
 """
-Last round only selection strategy.
+Last-round-only selection.
 
-Baseline selector that only selects messages from the last debate round,
-simulating selection strategies that only use final answers.
+What changed and why
+--------------------
+The previous version computed a single GLOBAL max round across all traces and
+kept only messages at that round. Two consequences:
+
+1. The debate harness appends a verifier at round max_rounds+1, so the global
+   max IS the verifier round. The baseline was selecting only verifier
+   messages -- the final answer restated -- not the last DEBATE round.
+2. Any trace that terminated early (the harness breaks when a generation comes
+   back empty) has a lower max round and contributed ZERO messages, silently
+   shrinking this arm's coverage relative to every other arm.
+
+Both are fixed: max round is computed per trace, and the verifier is excluded
+by default so this measures "train on the final revision only", which is the
+baseline you actually want to beat.
 """
 
-from typing import Any
+from __future__ import annotations
 
 from .base import Selector
 
 
 class LastRoundOnlySelector(Selector):
-    """
-    Selector that only uses messages from the last round.
+    """Keep only the final round of each trace."""
 
-    This is a baseline that simulates strategies that only
-    consider final answers, ignoring intermediate reasoning.
-    """
+    def __init__(self, include_verifier: bool = False, per_trace_budget: bool = True):
+        self.include_verifier = include_verifier
+        self.per_trace_budget = per_trace_budget
+        self.stats: dict = {}
 
-    def select(
-        self,
-        traces: list[Any],
-        utilities: dict[tuple[str, str], float],
-        token_budget: int,
-    ) -> dict[str, list[str]]:
-        """
-        Select only last-round messages within token budget.
+    def select(self, traces: list, utilities: dict, token_budget: int) -> dict:
+        selected: dict = {}
+        share = max(token_budget // max(len(traces), 1), 1)
+        total = 0
+        n_empty = 0
 
-        Args:
-            traces: List of debate traces.
-            utilities: Dictionary mapping (trace_id, mid) to utility scores.
-            token_budget: Maximum tokens allowed.
-
-        Returns:
-            Dictionary mapping trace_id to list of selected message IDs.
-        """
-        # Find max round across all traces
-        max_round = 0
-        for trace in traces:
-            for msg in trace.messages:
-                max_round = max(max_round, msg.round)
-
-        # Collect last-round messages
-        last_round_messages = []
         for trace in traces:
             trace_id = getattr(trace, "trace_id", getattr(trace, "pid", ""))
-            for msg in trace.messages:
-                if msg.round == max_round:
-                    tokens = self._estimate_tokens(msg.text)
-                    utility = utilities.get((trace_id, msg.mid), 0.0)
-                    last_round_messages.append((trace_id, msg.mid, utility, tokens))
+            msgs = [
+                m for m in trace.messages
+                if self.include_verifier or m.role != "verifier"
+            ]
+            if not msgs:
+                n_empty += 1
+                continue
 
-        # Sort by utility (descending) and select within budget
-        last_round_messages.sort(key=lambda x: x[2], reverse=True)
+            local_max = max(m.round for m in msgs)
+            picks = [m for m in msgs if m.round == local_max]
 
-        selected = {}
-        total_tokens = 0
+            used = 0
+            for m in picks:
+                tokens = self._estimate_tokens(m.text)
+                cap = share if self.per_trace_budget else token_budget
+                current = used if self.per_trace_budget else total
+                if current + tokens <= cap:
+                    selected.setdefault(trace_id, []).append(m.mid)
+                    used += tokens
+                    total += tokens
 
-        for trace_id, mid, utility, tokens in last_round_messages:
-            if total_tokens + tokens <= token_budget:
-                selected.setdefault(trace_id, []).append(mid)
-                total_tokens += tokens
+            if trace_id not in selected:
+                n_empty += 1
 
+        self.stats = {
+            "n_selected": sum(len(v) for v in selected.values()),
+            "n_traces_covered": len(selected),
+            "n_traces_empty": n_empty,
+            "tokens_used": total,
+        }
         return selected

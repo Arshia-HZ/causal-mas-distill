@@ -110,28 +110,65 @@ def assert_parents_invariant(trace: Trace, prompt_of=None) -> None:
     # For now, it's mainly checking the verifier if we default to render_verifier_messages.
 
 
+# Hard input budget for the verifier prompt. The proxy caps deepseek-v3.2 at
+# 8192 TOTAL tokens (the advertised 32k does not apply); leave headroom for
+# output tokens. Estimated as chars // 4, matching the selectors' convention.
+VERIFIER_TOKEN_BUDGET = 7000
+
+
+def _clip_middle(text: str, cap: int) -> str:
+    """Keep the head (reasoning) and tail (final answer), mark the cut."""
+    if len(text) <= cap:
+        return text
+    head = int(cap * 0.6)
+    tail = max(0, cap - head - 20)
+    return text[:head] + "\n[...truncated...]\n" + (text[-tail:] if tail else "")
+
+
 def render_verifier_messages(
     trace: Trace,
     exclude: Iterable[str] = (),
+    token_budget: int = VERIFIER_TOKEN_BUDGET,
+    overrides: dict | None = None,
 ) -> list[dict]:
     """
-    Render the prompt for the verifier from all prior messages, minus `exclude`.
+    Render the prompt for the verifier from all prior messages, minus exclude.
     Parent order follows trace order so the transcript reads chronologically.
+    If the rendered prompt would exceed token_budget, message bodies are
+    clipped head+tail to fit. Under-budget prompts are returned byte-identical
+    to the unclipped form, so existing disk-cache entries stay valid. Factual
+    and ablated conditions share this renderer, so clipping is identical
+    across conditions and the direct effect stays well-defined.
     """
     ex = set(exclude)
+    ov = overrides or {}
     
     out: list[dict] = [
         {"role": "system", "content": "You are the verifier in a multi-agent debate."},
         {"role": "user", "content": f"Question:\n{trace.question}"},
     ]
+    body_idx = []
     for msg in trace.messages:
         if msg.role == "verifier":
             continue
         if msg.mid in ex:
             continue
-        out.append({"role": "user", "content": f"[{msg.role} | {msg.mid}]\n{msg.text}"})
+        body_idx.append(len(out))
+        body = ov.get(msg.mid, msg.text)
+        out.append({"role": "user", "content": f"[{msg.role} | {msg.mid}]\n{body}"})
     
     out.append({"role": "user", "content": FINAL_INSTRUCTION})
+    
+    est = sum(len(m["content"]) for m in out) // 4
+    if est <= token_budget or not body_idx:
+        return out
+        
+    fixed = sum(len(m["content"]) for i, m in enumerate(out) if i not in body_idx)
+    cap = max(600, (token_budget * 4 - fixed) // len(body_idx))
+    for i in body_idx:
+        header, _, text = out[i]["content"].partition("\n")
+        out[i] = {"role": "user", "content": f"{header}\n{_clip_middle(text, cap)}"}
+        
     return out
 
 
