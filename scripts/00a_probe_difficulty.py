@@ -36,7 +36,7 @@ async def probe(problems, backend, k, temperature, log_every=25):
                 rates.append(p["pass_rate"])
             except Exception as e:
                 p["pass_rate"] = None
-                p["error"] = type(e).name
+                p["error"] = type(e).__name__
             done += 1
             if done % log_every == 0 or done == total:
                 mid = sum(1 for r in rates if 0.0 < r < 1.0)

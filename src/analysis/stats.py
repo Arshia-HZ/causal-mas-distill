@@ -4,12 +4,14 @@ Statistics for message-utility experiments.
 Everything here exists because binary-reward ablation at feasible k is a
 low-SNR measurement problem. Point estimates without these are not reportable.
 
-- paired_bootstrap_ci    : the only correct CI for "arm A vs arm B on the same items"
-- cluster_bootstrap_ci   : same, but resampling problems, because messages
-                           inside one trace are NOT independent observations
-- required_k             : power calculation. Run BEFORE spending API budget.
-- eb_shrink              : empirical-Bayes shrinkage; replaces hard significance gates
-- benjamini_hochberg     : FDR control for REPORTED claims (never for selection)
+Contents
+--------
+- paired_bootstrap_ci : the only correct CI for "arm A vs arm B on the same items"
+- cluster_bootstrap_ci: same, but resampling problems (not messages), because
+                        messages inside one trace are NOT independent
+- required_k          : power calculation. Run this BEFORE spending API budget.
+- eb_shrink           : empirical-Bayes shrinkage; replaces hard significance gates
+- benjamini_hochberg  : FDR control for REPORTED claims (not for selection)
 - variance_decomposition : how much of the spread in delta is measurement noise
 """
 
@@ -19,6 +21,9 @@ import math
 from dataclasses import dataclass, asdict
 
 import numpy as np
+
+
+# --------------------------------------------------------------- intervals
 
 
 @dataclass
@@ -35,13 +40,19 @@ class Interval:
         return asdict(self)
 
 
-def paired_bootstrap_ci(a, b, n_boot: int = 10_000, alpha: float = 0.05, seed: int = 0) -> Interval:
+def paired_bootstrap_ci(
+    a: list[float] | np.ndarray,
+    b: list[float] | np.ndarray,
+    n_boot: int = 10_000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> Interval:
     """
     CI for mean(a - b) where a[i] and b[i] are the SAME item under two arms.
 
     Resamples items, not arms. This is the correct test for "selector A beats
-    selector B on the same eval set", and it is strictly tighter than two
-    independent CIs -- which is why unpaired CIs make real effects look null.
+    selector B on the same eval set" and it is strictly tighter than two
+    independent CIs, which is why unpaired CIs make real effects look null.
     """
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
@@ -58,7 +69,13 @@ def paired_bootstrap_ci(a, b, n_boot: int = 10_000, alpha: float = 0.05, seed: i
     return Interval(float(d.mean()), float(lo), float(hi), int(d.size))
 
 
-def cluster_bootstrap_ci(values, clusters, n_boot: int = 10_000, alpha: float = 0.05, seed: int = 0) -> Interval:
+def cluster_bootstrap_ci(
+    values: list[float] | np.ndarray,
+    clusters: list[str],
+    n_boot: int = 10_000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> Interval:
     """
     CI for the mean of `values` when observations are grouped by `clusters`.
 
@@ -73,7 +90,8 @@ def cluster_bootstrap_ci(values, clusters, n_boot: int = 10_000, alpha: float = 
     order: dict[str, list[int]] = {}
     for i, c in enumerate(clusters):
         order.setdefault(c, []).append(i)
-    groups = [values[idxs] for idxs in order.values()]
+    keys = list(order)
+    groups = [values[order[k]] for k in keys]
 
     rng = np.random.default_rng(seed)
     boots = np.empty(n_boot, dtype=float)
@@ -82,7 +100,10 @@ def cluster_bootstrap_ci(values, clusters, n_boot: int = 10_000, alpha: float = 
         boots[t] = np.concatenate([groups[j] for j in pick]).mean()
 
     lo, hi = np.quantile(boots, [alpha / 2, 1 - alpha / 2])
-    return Interval(float(values.mean()), float(lo), float(hi), len(groups))
+    return Interval(float(values.mean()), float(lo), float(hi), len(keys))
+
+
+# --------------------------------------------------------------- power
 
 
 def se_of_delta(p_factual: float, p_ablated: float, k: int) -> float:
@@ -114,7 +135,7 @@ def required_k(effect: float, p_base: float = 0.5, power: float = 0.8, alpha: fl
 
 
 def _z(q: float) -> float:
-    """Inverse normal CDF (Acklam rational approximation)."""
+    """Inverse normal CDF (Acklam-style rational approximation)."""
     if not 0.0 < q < 1.0:
         raise ValueError("q must be in (0,1)")
     a = [-3.969683028665376e01, 2.209460984245205e02, -2.759285104469687e02,
@@ -137,7 +158,10 @@ def _z(q: float) -> float:
     return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*t / (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
 
 
-def eb_shrink(deltas, ses):
+# --------------------------------------------------------------- shrinkage
+
+
+def eb_shrink(deltas: list[float], ses: list[float]) -> tuple[list[float], dict]:
     """
     Empirical-Bayes (James-Stein style) shrinkage of noisy per-message effects.
 
@@ -146,12 +170,13 @@ def eb_shrink(deltas, ses):
     posterior mean is still the right thing to rank by: high-variance estimates
     get pulled toward the pooled mean and stop winning the top-k by luck.
 
-        tau2 = max(0, Var(delta) - mean(se^2))    # signal variance
-        w_i  = tau2 / (tau2 + se_i^2)             # per-item reliability
+        tau2 = max(0, Var(delta) - mean(se^2))       # signal variance
+        w_i  = tau2 / (tau2 + se_i^2)                 # per-item reliability
         post = mu + w_i * (delta_i - mu)
 
-    `signal_fraction` in the diagnostics is the headline number for a noise
-    audit: the share of observed spread that is real rather than sampling noise.
+    Returns (posterior_means, diagnostics). `signal_fraction` in the
+    diagnostics is the headline number for a noise audit: it is the share of
+    observed spread that is real rather than sampling noise.
     """
     d = np.asarray(deltas, dtype=float)
     s = np.asarray(ses, dtype=float)
@@ -178,7 +203,7 @@ def eb_shrink(deltas, ses):
     return [float(x) for x in post], diag
 
 
-def benjamini_hochberg(pvals, alpha: float = 0.05):
+def benjamini_hochberg(pvals: list[float], alpha: float = 0.05) -> list[bool]:
     """BH-FDR. Use for claims you REPORT, never as the data-selection rule."""
     p = np.asarray(pvals, dtype=float)
     n = p.size
@@ -189,23 +214,30 @@ def benjamini_hochberg(pvals, alpha: float = 0.05):
     passed = p[order] <= thresh
     keep = np.zeros(n, dtype=bool)
     if passed.any():
-        cutoff = int(np.max(np.nonzero(passed)[0]))
+        cutoff = np.max(np.nonzero(passed)[0])
         keep[order[: cutoff + 1]] = True
     return [bool(x) for x in keep]
 
 
-def variance_decomposition(replicate_estimates: dict) -> dict:
+def variance_decomposition(
+    replicate_estimates: dict[str, list[float]],
+) -> dict:
     """
     Split observed variance in delta into prediction noise vs data noise.
 
     `replicate_estimates` maps message_id -> repeated estimates of the SAME
-    delta (differing only in sampling seed).
+    delta (differing only in sampling seed). Then:
+
+        within  = mean over messages of Var(replicates)   -> prediction noise
+        between = Var over messages of mean(replicates)   -> data + signal
+        signal  = max(0, between - within / n_replicates)
 
     Report `noise_share`. If it is high, any selector built on these scores is
-    ranking noise -- itself a publishable finding about the method class.
+    ranking noise -- which is itself a publishable finding about the method
+    class, not just about your run.
     """
     withins, means, reps = [], [], []
-    for vals in replicate_estimates.values():
+    for _, vals in replicate_estimates.items():
         v = np.asarray(vals, dtype=float)
         if v.size < 2:
             continue

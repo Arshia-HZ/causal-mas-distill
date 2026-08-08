@@ -2,32 +2,31 @@
 """
 Chapter 1 audit: does the debate actually beat a budget-matched single model?
 
-Run this BEFORE any more utility estimation. It answers the question that
-makes or breaks the whole thesis, and it is cheap.
+  arm A  single CoT, 1 sample
+  arm B  self-consistency @ n_sc, TOKEN-MATCHED to the debate
+  arm C  the multi-agent debate            (requires --traces)
 
-Your probe already showed 676/785 MATH problems at teacher pass-rate 1.0. On
-those problems a debate cannot help, because there is nothing to fix. Any
-aggregate "MAS beats single-agent" number computed over that pool is dominated
-by problems with zero headroom. This script measures the comparison properly:
+Matching on budget rather than on calls is the whole point. A 3-round debate
+spends ~6 generations; compared against 1 sample it wins trivially and the
+result means nothing. Compared against 6 samples of self-consistency it often
+does not win, and that negative result, measured cleanly and stratified by
+headroom, is a genuine contribution rather than a failed experiment.
 
-  arm A  single CoT, 1 sample                (cheapest)
-  arm B  self-consistency @ n, TOKEN-MATCHED to the debate
-  arm C  the multi-agent debate              (needs --traces)
+Three things this script is careful about:
 
-Matching on tokens rather than on calls is the whole point. A 3-round debate
-spends roughly 6 generations; compared against 1 sample it wins trivially and
-the result means nothing. Compared against 6 samples of self-consistency it
-often does not win -- and that negative result, measured cleanly and
-stratified by headroom, is a genuine contribution rather than a failed
-experiment.
+1. n_probe != n_sc. The pass rate wants MANY samples (low variance). The
+   self-consistency arm must use exactly the debate budget. Conflating them
+   silently hands arm B a budget it never paid for.
+2. Single-CoT accuracy is estimated by the pass rate, not by one Bernoulli
+   draw. Same expectation, far less variance, free.
+3. Debate correctness is averaged over seeds per problem. Keying a dict on pid
+   would silently keep whichever seed happened to be last in the file.
 
-Outputs
-  results/audit/headroom_audit.json   per-problem records + aggregate CIs
-  stdout                              a table you can paste into the thesis
-
-Usage
-  python scripts/00c_headroom_audit.py --problems data/gate_problems.json \\
-      --config configs/teacher_api_deepseek.yaml --n-probe 8 --limit 60
+Usage:
+  python scripts/00d_build_audit_pool.py --probed data/probed_all.json
+  python scripts/01_generate_debates.py  --problems data/trace_targets.json
+  python scripts/00c_headroom_audit.py --problems data/audit_pool.json \
+      --traces data/traces.jsonl --n-probe 32 --n-sc 6
 """
 
 from __future__ import annotations
@@ -35,8 +34,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import random
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -64,101 +64,171 @@ def majority_vote(answers):
     return Counter(vals).most_common(1)[0][0]
 
 
+def self_consistency_accuracy(answers, gold, n_sc, n_repeats, rng):
+    """Expected accuracy of majority-vote@n_sc, estimated by resampling subsets
+    of size n_sc from the probe samples. Averaging over subsets removes the
+    which-six-did-you-draw lottery from the headline number."""
+    if not answers:
+        return 0.0
+    n_sc = min(n_sc, len(answers))
+    hits = 0
+    for _ in range(n_repeats):
+        subset = rng.sample(answers, n_sc)
+        v = majority_vote(subset)
+        hits += int(v is not None and is_correct("\\boxed{" + str(v) + "}", gold))
+    return hits / n_repeats
+
+
+def load_debate_accuracy(path):
+    """pid -> mean final_correct across all seeds for that pid."""
+    per_pid = defaultdict(list)
+    n_lines = 0
+    for line in open(path):
+        if not line.strip():
+            continue
+        t = json.loads(line)
+        pid = t.get("pid")
+        if pid is None:
+            continue
+        per_pid[pid].append(1.0 if t.get("final_correct") else 0.0)
+        n_lines += 1
+    acc = {pid: sum(v) / len(v) for pid, v in per_pid.items()}
+    seeds = {pid: len(v) for pid, v in per_pid.items()}
+    return acc, seeds, n_lines
+
+
+def summarise(records, key_a, key_b, label_a, label_b):
+    a = [r[key_a] for r in records]
+    b = [r[key_b] for r in records]
+    ci = paired_bootstrap_ci(a, b)
+    return {
+        "n": len(records),
+        "acc_" + label_a: sum(a) / len(a) if a else 0.0,
+        "acc_" + label_b: sum(b) / len(b) if b else 0.0,
+        "delta": ci.to_dict(),
+    }
+
+
 async def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--problems", default="data/gate_problems.json")
+    ap.add_argument("--problems", default="data/audit_pool.json",
+                    help="Stratified pool from 00d. Do NOT pass gate_problems.json: "
+                         "it is pre-filtered to headroom and destroys the contrast.")
     ap.add_argument("--config", default="configs/teacher_api_deepseek.yaml")
-    ap.add_argument("--traces", default=None, help="Optional traces jsonl, adds arm C.")
-    ap.add_argument("--n-probe", type=int, default=8, help="6 matches a 3-round debate.")
+    ap.add_argument("--traces", default=None, help="Debate traces jsonl. REQUIRED for arm C.")
+    ap.add_argument("--n-probe", type=int, default=32)
+    ap.add_argument("--n-sc", type=int, default=6,
+                    help="Self-consistency budget. Match the debate generation count.")
+    ap.add_argument("--sc-repeats", type=int, default=64)
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--temperature", type=float, default=0.7)
+    ap.add_argument("--concurrency", type=int, default=24)
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--cache-path", default="cache_audit.jsonl")
     ap.add_argument("--out", default="results/audit/headroom_audit.json")
     args = ap.parse_args()
 
+    rng = random.Random(args.seed)
     cfg = yaml.safe_load(open(args.config))
     problems = json.load(open(args.problems))
     if args.limit:
         problems = problems[: args.limit]
+
+    bang = "!" * 66
+    if not args.traces:
+        print(bang)
+        print("WARNING: no --traces given, so there is NO DEBATE ARM.")
+        print("You will get SC vs single only, which does not answer the gate.")
+        print(bang)
+
+    strata_in = Counter(p.get("stratum", "unlabelled") for p in problems)
+    if strata_in.get("ceiling", 0) == 0:
+        print(bang)
+        print("WARNING: the pool contains no ceiling problems, so")
+        print("effective_support_frac will be meaningless. Build the pool with")
+        print("scripts/00d_build_audit_pool.py first.")
+        print(bang)
 
     backend = ApiBackend(
         model=cfg["model"],
         base_url=cfg.get("base_url"),
         api_key_env=cfg.get("api_key_env"),
         max_tokens=cfg.get("max_tokens", 2048),
+        cache_path=args.cache_path,
+        concurrency=args.concurrency,
+        extra_body={"thinking": {"type": "disabled"}},
     )
 
-    debate_correct = {}
+    debate_acc, debate_seeds, n_trace_lines = ({}, {}, 0)
     if args.traces:
-        for line in open(args.traces):
-            if line.strip():
-                t = json.loads(line)
-                debate_correct[t["pid"]] = bool(t.get("final_correct", False))
+        debate_acc, debate_seeds, n_trace_lines = load_debate_accuracy(args.traces)
+        seed_counts = Counter(debate_seeds.values())
+        print("loaded " + str(n_trace_lines) + " traces over " + str(len(debate_acc))
+              + " problems (seeds per problem: " + str(dict(seed_counts)) + ")")
 
-    records = []
-    for i, p in enumerate(problems):
-        pid = p.get("pid", "p%04d" % i)
+    sem = asyncio.Semaphore(args.concurrency)
+    done = 0
+    total = len(problems)
+
+    async def one(i, p):
+        nonlocal done
+        pid = p.get("pid") or ("p%04d" % i)
         q = p.get("question") or p.get("problem") or ""
         gold = str(p.get("gold") or p.get("answer") or "")
         if not q or not gold:
-            continue
-
-        rate, answers, flags = await probe_problem(backend, q, gold, args.n_probe, args.temperature)
-        sc = majority_vote(answers)
-        sc_correct = bool(sc is not None and is_correct("\\boxed{" + str(sc) + "}", gold))
-
-        records.append({
+            return None
+        async with sem:
+            rate, answers, flags = await probe_problem(
+                backend, q, gold, args.n_probe, args.temperature
+            )
+        sc_acc = self_consistency_accuracy(answers, gold, args.n_sc, args.sc_repeats, rng)
+        done += 1
+        if done % 25 == 0 or done == total:
+            print("  probed " + str(done) + "/" + str(total), flush=True)
+        auto = "ceiling" if rate >= 1.0 else "floor" if rate <= 0.0 else "headroom"
+        return {
             "pid": pid,
+            "stratum": p.get("stratum") or auto,
+            "sample_weight": p.get("sample_weight", 1.0),
             "pass_rate": rate,
-            "single_correct": bool(flags[0]) if flags else False,
-            "sc_correct": sc_correct,
-            "debate_correct": debate_correct.get(pid),
+            "single": rate,
+            "sc": sc_acc,
+            "debate": debate_acc.get(pid),
+            "n_seeds": debate_seeds.get(pid, 0),
             "headroom": 0.0 < rate < 1.0,
             "n_probe": args.n_probe,
-        })
-        print("[%d/%d] %s  pass=%.3f  single=%s  sc=%s"
-              % (i + 1, len(problems), pid, rate, records[-1]["single_correct"], sc_correct),
-              flush=True)
+            "n_sc": args.n_sc,
+        }
 
+    gathered = await asyncio.gather(*[one(i, p) for i, p in enumerate(problems)])
+    records = [r for r in gathered if r]
     await backend.close()
 
     n = len(records)
-    ceiling = sum(1 for r in records if r["pass_rate"] >= 1.0)
-    floor = sum(1 for r in records if r["pass_rate"] <= 0.0)
-    mid = n - ceiling - floor
+    if n == 0:
+        print("no usable problems")
+        return
 
-    single = [1.0 if r["single_correct"] else 0.0 for r in records]
-    scv = [1.0 if r["sc_correct"] else 0.0 for r in records]
-
+    counts = Counter(r["stratum"] for r in records)
     summary = {
         "n_problems": n,
-        "n_ceiling": ceiling,
-        "n_floor": floor,
-        "n_headroom": mid,
-        "effective_support_frac": (mid / n) if n else 0.0,
-        "acc_single": (sum(single) / n) if n else 0.0,
-        "acc_self_consistency": (sum(scv) / n) if n else 0.0,
-        "sc_vs_single": paired_bootstrap_ci(scv, single).to_dict(),
+        "strata": dict(counts),
+        "effective_support_frac": counts.get("headroom", 0) / n,
+        "n_probe": args.n_probe,
+        "n_sc": args.n_sc,
+        "sc_vs_single": summarise(records, "sc", "single", "sc", "single"),
     }
 
-    have = [r for r in records if r["debate_correct"] is not None]
-    if have:
-        d = [1.0 if r["debate_correct"] else 0.0 for r in have]
-        s = [1.0 if r["sc_correct"] else 0.0 for r in have]
-        o = [1.0 if r["single_correct"] else 0.0 for r in have]
-        summary["acc_debate"] = sum(d) / len(d)
-        summary["debate_vs_sc"] = paired_bootstrap_ci(d, s).to_dict()
-        summary["debate_vs_single"] = paired_bootstrap_ci(d, o).to_dict()
-
-        hr = [r for r in have if r["headroom"]]
-        if hr:
-            dh = [1.0 if r["debate_correct"] else 0.0 for r in hr]
-            sh = [1.0 if r["sc_correct"] else 0.0 for r in hr]
-            summary["headroom_only"] = {
-                "n": len(hr),
-                "acc_debate": sum(dh) / len(dh),
-                "acc_self_consistency": sum(sh) / len(sh),
-                "debate_vs_sc": paired_bootstrap_ci(dh, sh).to_dict(),
-            }
+    withd = [r for r in records if r["debate"] is not None]
+    if withd:
+        summary["debate_vs_sc"] = summarise(withd, "debate", "sc", "debate", "sc")
+        summary["debate_vs_single"] = summarise(withd, "debate", "single", "debate", "single")
+        for stratum in ("headroom", "ceiling", "floor"):
+            sub = [r for r in withd if r["stratum"] == stratum]
+            if len(sub) >= 5:
+                summary["debate_vs_sc__" + stratum] = summarise(sub, "debate", "sc", "debate", "sc")
+    else:
+        summary["debate_vs_sc"] = None
 
     summary["power_note"] = {
         "k_for_effect_0.10": required_k(0.10),
@@ -170,28 +240,56 @@ async def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     json.dump({"summary": summary, "records": records}, open(out, "w"), indent=2)
 
+    def line(tag, block):
+        if not block:
+            return
+        d = block["delta"]
+        star = "  <-- CI excludes 0" if (d["lo"] > 0 or d["hi"] < 0) else ""
+        print("  %-26s: %+.3f  [%+.3f, %+.3f]  n=%d%s"
+              % (tag, d["point"], d["lo"], d["hi"], block["n"], star))
+
     bar = "=" * 66
     print("\n" + bar)
     print("HEADROOM AUDIT")
     print(bar)
-    if n:
-        print("problems              : %d" % n)
-        print("  ceiling (pass=1.0)  : %d  (%.1f%%)" % (ceiling, 100.0 * ceiling / n))
-        print("  floor   (pass=0.0)  : %d  (%.1f%%)" % (floor, 100.0 * floor / n))
-        print("  headroom            : %d  (%.1f%%)  <- only these can move" % (mid, 100.0 * mid / n))
-    print("acc single CoT        : %.3f" % summary["acc_single"])
-    print("acc self-consistency  : %.3f" % summary["acc_self_consistency"])
-    ci = summary["sc_vs_single"]
-    print("  SC - single         : %+.3f  [%+.3f, %+.3f]" % (ci["point"], ci["lo"], ci["hi"]))
-    if "acc_debate" in summary:
-        print("acc debate            : %.3f" % summary["acc_debate"])
-        ci = summary["debate_vs_sc"]
-        print("  debate - SC         : %+.3f  [%+.3f, %+.3f]" % (ci["point"], ci["lo"], ci["hi"]))
-        print("  ^ if this CI contains 0, the debate is not buying accuracy at")
-        print("    matched budget. That is a reportable finding, and it points")
-        print("    the thesis at MAS-as-data-engine.")
+    print("problems                  : %d" % n)
+    for k in ("headroom", "ceiling", "floor"):
+        if counts.get(k):
+            print("  %-24s: %4d  (%.1f%%)" % (k, counts[k], 100.0 * counts[k] / n))
+    print("effective support         : %.1f%%   <- only these problems can move"
+          % (100.0 * summary["effective_support_frac"]))
+    print("budget                    : n_probe=%d, n_sc=%d" % (args.n_probe, args.n_sc))
+    print("-" * 66)
+    print("acc single CoT            : %.3f" % summary["sc_vs_single"]["acc_single"])
+    print("acc self-consistency@%-4d : %.3f" % (args.n_sc, summary["sc_vs_single"]["acc_sc"]))
+    if withd:
+        print("acc debate                : %.3f" % summary["debate_vs_sc"]["acc_debate"])
+    print("-" * 66)
+    print("paired differences (95% bootstrap CI)")
+    line("SC - single", summary["sc_vs_single"])
+    line("debate - single", summary.get("debate_vs_single"))
+    line("debate - SC  [THE GATE]", summary.get("debate_vs_sc"))
+    for stratum in ("headroom", "ceiling", "floor"):
+        line("debate - SC (" + stratum + ")", summary.get("debate_vs_sc__" + stratum))
     print(bar)
-    print("written -> %s" % out)
+    if withd:
+        d = summary["debate_vs_sc"]["delta"]
+        if d["lo"] > 0:
+            print("GATE PASSED: debate beats matched-budget self-consistency.")
+            print("  -> the debate is a legitimate teacher. Proceed to utility")
+            print("     estimation on the headroom stratum.")
+        else:
+            print("GATE NOT PASSED: the CI contains 0 (or is negative).")
+            print("  -> the debate is NOT buying accuracy at matched budget.")
+            print("     This is a reportable finding, not a failure. The thesis")
+            print("     becomes MAS-as-data-engine: debate transcripts are still")
+            print("     valuable as TRAINING DATA (error-correction traces that")
+            print("     self-consistency cannot produce) even when they are not")
+            print("     worth the tokens at inference time.")
+    else:
+        print("NO DEBATE ARM. Re-run with --traces to answer the gate.")
+    print(bar)
+    print("written -> " + str(out))
 
 
 if __name__ == "__main__":

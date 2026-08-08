@@ -19,21 +19,20 @@ off a descendant no matter what you delete upstream.
 Consequence: CDE(m) ~ 0 by construction for every non-terminal message,
 regardless of task difficulty. Saturation makes this worse but is NOT the
 root cause. A decisive critique on an unsaturated problem still scores 0.
-See tests/test_estimand.py for a executable demonstration.
 
 This module adds the two estimands that are not structurally degenerate.
 
-1. total_effect       -- delete m, then REGENERATE every descendant.
-                         Measures what the message actually contributed.
-                         Cost: k * (1 + n_descendants) generations per message.
+1. total_effect      -- delete m, then REGENERATE every descendant.
+                        Measures what the message actually contributed.
+                        Cost: k * (1 + n_descendants) generations per message.
 
-2. ablation_surrogate -- delete random SUBSETS, fit a linear model of outcome
-                         on presence indicators (ContextCite-style). Fixed cost
-                         S regardless of message count, and it recovers
-                         interactions that leave-one-out cannot see.
+2. ablation_surrogate-- delete random SUBSETS, fit a linear model of outcome
+                        on presence indicators (ContextCite-style). Fixed cost
+                        S regardless of message count, and it recovers
+                        interactions that leave-one-out cannot see.
 
-3. student_utility    -- measure the effect on the SMALL MODEL YOU WILL TRAIN,
-                         not on the teacher. See student_utility.py.
+3. student_utility   -- measure the effect on the SMALL MODEL YOU WILL TRAIN,
+                        not on the teacher. See student_utility.py.
 
 Known bias, stated on purpose
 -----------------------------
@@ -48,21 +47,24 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, asdict, field
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
 from ..debate.schema import Trace, Message, descendants, topo_order
-from .replay import render_verifier_messages, terminal_mid
+from .replay import render_verifier_messages, terminal_mid, _clip_middle
 
 try:
-    from eval.grade import is_correct
-except ImportError:  # allow import when cwd is not the repo root
+    from eval.grade import is_correct, extract_answer
+except ImportError:  # running as a plain package
     import sys
     from pathlib import Path
 
     sys.path.append(str(Path(__file__).resolve().parents[2]))
-    from eval.grade import is_correct
+    from eval.grade import is_correct, extract_answer
+
+
+# ------------------------------------------------------------------ result
 
 
 @dataclass
@@ -89,24 +91,19 @@ class UtilityResult:
 # --------------------------------------------------------- prompt rebuilding
 
 
-def _text_of(trace: Trace, mid: str, overrides: dict) -> str:
+def _text_of(trace: Trace, mid: str, overrides: dict[str, str]) -> str:
     if mid in overrides:
         return overrides[mid]
     m = trace.get_message(mid)
     return m.text if m else ""
 
 
-def _role_of(trace: Trace, mid: str) -> str:
-    m = trace.get_message(mid)
-    return m.role if m else "?"
-
-
 def default_node_prompt(
     trace: Trace,
     node: Message,
-    overrides: dict,
-    dropped: set,
-):
+    overrides: dict[str, str],
+    dropped: set[str],
+) -> list[dict] | None:
     """
     Rebuild the prompt for `node` given regenerated `overrides` and a set of
     `dropped` message ids. Returns None when the node cannot run at all
@@ -127,7 +124,7 @@ def default_node_prompt(
         return render_verifier_messages(trace, exclude=dropped, overrides=overrides)
 
     if node.role == "critic":
-        solver_parents = [p for p in live_parents if _role_of(trace, p) == "solver"]
+        solver_parents = [p for p in live_parents if (trace.get_message(p) or Message(p, 0, "?", "")).role == "solver"]
         if not solver_parents:
             return None  # nothing left to critique
         target = _text_of(trace, solver_parents[-1], overrides)
@@ -138,8 +135,8 @@ def default_node_prompt(
     if node.role == "solver":
         if not node.parents:
             return [{"role": "user", "content": get_solve_prompt(trace.question)}]
-        solver_parents = [p for p in live_parents if _role_of(trace, p) == "solver"]
-        critic_parents = [p for p in live_parents if _role_of(trace, p) == "critic"]
+        solver_parents = [p for p in live_parents if (trace.get_message(p) or Message(p, 0, "?", "")).role == "solver"]
+        critic_parents = [p for p in live_parents if (trace.get_message(p) or Message(p, 0, "?", "")).role == "critic"]
         prev = _text_of(trace, solver_parents[-1], overrides) if solver_parents else ""
         crit = _text_of(trace, critic_parents[-1], overrides) if critic_parents else ""
         if not prev.strip() and not crit.strip():
@@ -148,25 +145,25 @@ def default_node_prompt(
             # Critique deleted: the reviser runs with no feedback. This is the
             # honest "message removed" semantics, and it is exactly where
             # removal-induced distribution shift enters. Flagged by caller.
-            crit = "(no feedback was provided)"
+            return [{"role": "user", "content": get_revision_prompt(trace.question, prev, "(no feedback was provided)")}]
         return [{"role": "user", "content": get_revision_prompt(trace.question, prev, crit)}]
 
     return None
 
 
-# ------------------------------------------------------------- total effect
+# ------------------------------------------------------------ total effect
 
 
 async def _p_correct_with_regen(
     trace: Trace,
-    dropped: set,
+    dropped: set[str],
     backend: Any,
     k: int,
     temperature: float,
     max_regen_depth: int | None,
     node_prompt: Callable = default_node_prompt,
     nonce: str = "",
-):
+) -> tuple[float, int, bool]:
     """
     Regenerate every descendant of the dropped set, then score the terminal.
 
@@ -174,13 +171,13 @@ async def _p_correct_with_regen(
 
     Runs k independent worlds. Each world regenerates the affected subgraph
     once, so downstream variation is preserved -- that is the whole point of
-    the total effect, and the reason it cannot be shared across messages the
+    the total effect and the reason it cannot be shared across messages the
     way the factual condition can.
     """
     term = terminal_mid(trace)
-    affected: set = set()
+    affected: set[str] = set()
     for d in dropped:
-        affected |= set(descendants(trace, d))
+        affected |= descendants(trace, d)
     affected.discard(term)
 
     order = topo_order(trace, affected)
@@ -193,7 +190,7 @@ async def _p_correct_with_regen(
     n_regen = 0
 
     for w in range(k):
-        overrides: dict = {}
+        overrides: dict[str, str] = {}
         for mid in order:
             node = trace.get_message(mid)
             if node is None:
@@ -230,19 +227,19 @@ async def trace_utilities_total(
     temperature: float = 0.7,
     max_regen_depth: int | None = None,
     node_prompt: Callable = default_node_prompt,
-):
+) -> list[UtilityResult]:
     """
-    Total effect of each non-terminal message: delete it, let the debate re-run
-    downstream, and see whether the final answer still lands.
+    Total effect of each non-terminal message: delete it and let the debate
+    re-run downstream.
 
     Cost, RCR chain of 5 non-terminal messages at k worlds:
-        factual : k terminal generations (shared across all messages)
-        per msg : k * (1 + n_descendants) generations
-        total  ~= k * 21 generations per trace, vs k * 6 for the direct effect
+        factual  : k terminal generations (shared)
+        per msg  : k * (1 + n_descendants) generations
+        total    ~ k * 21 generations per trace vs k * 6 for the direct effect
 
-    On 30 problems at k=8 that is roughly 5k short generations. Against the
-    ~20 minutes you measured for the direct pass, budget 1.5-2 hours. Still an
-    overnight free-tier job, and it is the only version of this measurement
+    On 30 problems at k=8 that is roughly 5k short generations. At the ~20
+    minutes you measured for the direct pass, budget ~1.5-2 hours. Still a
+    free-tier overnight job, and it is the only version of the measurement
     that can return a non-zero answer.
     """
     term = terminal_mid(trace)
@@ -250,13 +247,12 @@ async def trace_utilities_total(
         trace, set(), backend, k, temperature, max_regen_depth, node_prompt, nonce="factual"
     )
 
-    out = []
+    out: list[UtilityResult] = []
     for m in trace.messages:
         if m.mid == term:
             continue
         p_abl, n_regen, degen = await _p_correct_with_regen(
-            trace, {m.mid}, backend, k, temperature, max_regen_depth,
-            node_prompt, nonce=f"abl:{m.mid}",
+            trace, {m.mid}, backend, k, temperature, max_regen_depth, node_prompt, nonce=f"abl:{m.mid}"
         )
         se = math.sqrt(
             max(p_fact * (1 - p_fact), 0.0) / k + max(p_abl * (1 - p_abl), 0.0) / k
@@ -282,28 +278,28 @@ async def trace_utilities_total(
     return out
 
 
-# -------------------------------------------------------- ablation surrogate
+# ------------------------------------------------------- ablation surrogate
 
 
 @dataclass
 class SurrogateFit:
-    mids: list
-    weights: list
+    mids: list[str]
+    weights: list[float]
     intercept: float
     r2: float
     n_ablations: int
     holdout_r2: float = 0.0
-    masks: list = field(default_factory=list)
-    outcomes: list = field(default_factory=list)
+    masks: list[list[int]] = field(default_factory=list)
+    outcomes: list[float] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = asdict(self)
-        d.pop("masks", None)
-        d.pop("outcomes", None)
+        d.pop("masks")
+        d.pop("outcomes")
         return d
 
 
-def _ridge(X: np.ndarray, y: np.ndarray, l2: float):
+def _ridge(X: np.ndarray, y: np.ndarray, l2: float) -> tuple[np.ndarray, float]:
     n, p = X.shape
     Xb = np.hstack([np.ones((n, 1)), X])
     A = Xb.T @ Xb + l2 * np.eye(p + 1)
@@ -331,15 +327,15 @@ async def ablation_surrogate(
     Why this beats leave-one-out here:
       - fixed cost (n_ablations) instead of O(n_messages)
       - it can see redundancy. Two messages that each restate the answer both
-        score ~0 under LOO; the surrogate gives them a shared positive weight
-        because the subsets where BOTH are absent do fail.
+        score ~0 under LOO; the surrogate assigns them a shared positive
+        weight because the subsets where BOTH are absent do fail.
       - `r2` is a built-in faithfulness check. A low r2 means the linear
         surrogate does not describe this trace and the scores should not be
-        used. Report that fraction; it is a real finding, not a failure.
+        used -- report that fraction, it is a real finding.
 
     Set regenerate=True to combine subset ablation with downstream replay
-    (recommended). regenerate=False keeps the verifier-only protocol and will
-    inherit the redundancy masking described at the top of this file.
+    (recommended, more expensive). regenerate=False keeps the verifier-only
+    protocol and will inherit the redundancy masking described above.
     """
     term = terminal_mid(trace)
     mids = [m.mid for m in trace.messages if m.mid != term]
@@ -347,7 +343,8 @@ async def ablation_surrogate(
         return SurrogateFit([], [], 0.0, 0.0, 0)
 
     rng = np.random.default_rng(seed)
-    masks, ys = [], []
+    masks: list[list[int]] = []
+    ys: list[float] = []
 
     for t in range(n_ablations):
         if t == 0:
@@ -356,15 +353,15 @@ async def ablation_surrogate(
             mask = (rng.random(len(mids)) < keep_prob).astype(int)
             if mask.sum() == 0:
                 mask[rng.integers(0, len(mids))] = 1
-        droppedset = {mid for mid, keep in zip(mids, mask) if keep == 0}
+        dropped = {mid for mid, keep in zip(mids, mask) if keep == 0}
 
         if regenerate:
             p, _, _ = await _p_correct_with_regen(
-                trace, droppedset, backend, k_per_ablation, temperature,
-                max_regen_depth, default_node_prompt, nonce=f"surr{t}",
+                trace, dropped, backend, k_per_ablation, temperature,
+                max_regen_depth, default_node_prompt, nonce=f"surr{t}"
             )
         else:
-            msgs = render_verifier_messages(trace, exclude=droppedset)
+            msgs = render_verifier_messages(trace, exclude=dropped)
             outs = await backend.generate(
                 msgs, n=k_per_ablation, temperature=temperature, cache_nonce=f"surr{t}"
             )
@@ -376,12 +373,12 @@ async def ablation_surrogate(
     X = np.asarray(masks, dtype=float)
     y = np.asarray(ys, dtype=float)
     w, b = _ridge(X, y, l2)
-
     pred = X @ w + b
     ss_res = float(((y - pred) ** 2).sum())
     ss_tot = float(((y - y.mean()) ** 2).sum())
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
 
+    # simple 2-fold holdout so r2 is not purely in-sample
     holdout = 0.0
     if len(y) >= 8:
         half = len(y) // 2

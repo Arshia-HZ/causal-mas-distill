@@ -19,18 +19,19 @@ This version matches the reference selection on three axes:
    "random" from accidentally becoming "mostly critics".
 
 Without a reference it falls back to unmatched random and says so in
-self.stats, so an unmatched run can never be silently reported as matched.
+`self.stats`, so an unmatched run can never be mistaken for a matched one.
 """
 
 from __future__ import annotations
 
 import random
+from typing import Any
 
 from .base import Selector
 
 
 def _bucket(tokens: int) -> int:
-    """Coarse length buckets. Wide enough that candidates almost always exist."""
+    """Coarse log-ish length buckets. Wide enough to always have candidates."""
     if tokens < 128:
         return 0
     if tokens < 256:
@@ -52,11 +53,11 @@ class RandomLenMatchedSelector(Selector):
 
     def select(
         self,
-        traces: list,
-        utilities: dict,
+        traces: list[Any],
+        utilities: dict[tuple[str, str], float],
         token_budget: int,
-        reference: dict | None = None,
-    ) -> dict:
+        reference: dict[str, list[str]] | None = None,
+    ) -> dict[str, list[str]]:
         """
         Args:
             reference: trace_id -> selected mids from the arm being matched
@@ -68,7 +69,7 @@ class RandomLenMatchedSelector(Selector):
             self.stats = {"matched": False, "warning": "no reference: unmatched random"}
             return self._unmatched(traces, token_budget, rng)
 
-        selected: dict = {}
+        selected: dict[str, list[str]] = {}
         tokens_ref = tokens_new = 0
         n_exact = n_fallback = 0
 
@@ -83,7 +84,7 @@ class RandomLenMatchedSelector(Selector):
                 t = self._estimate_tokens(m.text)
                 pool[m.mid] = (t, _bucket(t), m.role)
 
-            taken: set = set()
+            taken: set[str] = set()
             for mid in ref_mids:
                 if mid not in pool:
                     continue
@@ -100,8 +101,8 @@ class RandomLenMatchedSelector(Selector):
                 if cands:
                     n_exact += 1
                 else:
-                    # widen: nearest bucket first, then anything unused
-                    cands = [c for c in pool if c not in taken]
+                    # widen: nearest bucket, then anything unused
+                    cands = [c for c, (t, b, r) in pool.items() if c not in taken]
                     if not cands:
                         continue
                     cands.sort(key=lambda c: abs(pool[c][1] - want_bucket))
@@ -127,7 +128,7 @@ class RandomLenMatchedSelector(Selector):
         }
         return selected
 
-    def _unmatched(self, traces, token_budget, rng) -> dict:
+    def _unmatched(self, traces, token_budget, rng) -> dict[str, list[str]]:
         all_msgs = []
         for trace in traces:
             trace_id = getattr(trace, "trace_id", getattr(trace, "pid", ""))
@@ -135,7 +136,7 @@ class RandomLenMatchedSelector(Selector):
                 all_msgs.append((trace_id, msg.mid, self._estimate_tokens(msg.text)))
         rng.shuffle(all_msgs)
 
-        selected: dict = {}
+        selected: dict[str, list[str]] = {}
         total = 0
         for trace_id, mid, tokens in all_msgs:
             if total + tokens <= token_budget:

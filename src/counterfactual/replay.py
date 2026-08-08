@@ -129,7 +129,7 @@ def render_verifier_messages(
     trace: Trace,
     exclude: Iterable[str] = (),
     token_budget: int = VERIFIER_TOKEN_BUDGET,
-    overrides: dict | None = None,
+    overrides: dict[str, str] | None = None,
 ) -> list[dict]:
     """
     Render the prompt for the verifier from all prior messages, minus exclude.
@@ -142,7 +142,7 @@ def render_verifier_messages(
     """
     ex = set(exclude)
     ov = overrides or {}
-    
+
     out: list[dict] = [
         {"role": "system", "content": "You are the verifier in a multi-agent debate."},
         {"role": "user", "content": f"Question:\n{trace.question}"},

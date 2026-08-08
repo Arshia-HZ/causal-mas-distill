@@ -23,7 +23,27 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4, help="Per-device batch size")
     parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument("--max-seq-length", type=int, default=4096, help="Maximum sequence length")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Training seed. Every reported number needs >=3 seeds; "
+                             "a single-seed LoRA delta is not evidence.")
     args = parser.parse_args()
+
+    # seed everything reachable before the trainer is constructed
+    import random
+    import numpy as np
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    try:
+        import torch
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+    except Exception:
+        pass
+    try:
+        from transformers import set_seed
+        set_seed(args.seed)
+    except Exception:
+        pass
 
     # Load dataset
     with open(args.dataset) as f:
@@ -31,10 +51,16 @@ def main():
 
     print(f"Loaded {len(examples)} training examples")
 
+    out_dir = Path(args.output_dir)
+    if not out_dir.name.startswith("seed"):
+        out_dir = out_dir / ("seed%d" % args.seed)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print("seed=%d -> %s" % (args.seed, out_dir))
+
     # Create trainer
     trainer = DistillationTrainer(
         model_name_or_path=args.model,
-        output_dir=Path(args.output_dir),
+        output_dir=out_dir,
         max_seq_length=args.max_seq_length,
     )
 
@@ -47,7 +73,7 @@ def main():
         learning_rate=args.lr,
     )
 
-    print(f"Training complete. Checkpoints saved to {args.output_dir}")
+    print(f"Training complete. Checkpoints saved to {out_dir}")
 
 
 if __name__ == "__main__":

@@ -137,8 +137,8 @@ class ApiBackend:
         mt = max_tokens or self.max_tokens
 
         # Split n into provider-sized chunks. Each chunk gets its own cache
-        # key (the chunk index is part of the key) so replicates never
-        # collapse onto one cached draw, which would silently zero variance.
+        # key (chunk index is part of the key) so replicates never collapse
+        # onto one cached draw, which would silently zero the variance.
         chunks = []
         remaining = n
         while remaining > 0:
@@ -148,10 +148,7 @@ class ApiBackend:
 
         results: list[str] = []
         for ci, take in enumerate(chunks):
-            if len(chunks) == 1:
-                nonce = cache_nonce
-            else:
-                nonce = (cache_nonce or '') + '|chunk' + str(ci)
+            nonce = cache_nonce if len(chunks) == 1 else f"{cache_nonce or ''}|chunk{ci}"
             key = key_of({"m": messages, "n": take, "t": temperature,
                           "mt": mt, "mo": self.model, "c": nonce})
 

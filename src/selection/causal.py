@@ -15,19 +15,19 @@ Three fixes:
 1. Shrinkage instead of thresholding. Rank by the empirical-Bayes posterior
    mean, not the raw estimate. At k<=32 a raw delta is mostly noise; the
    posterior mean pulls unreliable estimates toward the pooled mean so they
-   stop winning top-k by luck. Set shrink=False to reproduce the old
-   behaviour as an ablation -- that comparison is itself a paper result.
+   stop winning top-k by luck. Set `shrink=False` to reproduce the old
+   behaviour as an ablation -- that comparison is a paper result.
 
 2. Explicit tie policy. Exact ties are the dominant case in a saturated
    regime. Breaking them by trace order silently encodes position. We break
-   them randomly under a fixed seed and record n_ties_broken, so the
+   them randomly under a fixed seed and record `n_ties_broken` so the
    confound is visible instead of hidden.
 
-3. Per-trace budget. Filling one global token budget greedily by score lets a
-   high-scoring trace consume the whole budget, so different selectors cover
-   different numbers of PROBLEMS. That is a coverage confound on top of the
-   thing you want to measure. per_trace_budget=True gives every trace the
-   same allowance, which makes the arms genuinely comparable.
+3. Per-trace budget. Filling one global token budget greedily by score lets
+   a high-scoring trace consume the whole budget, so different selectors
+   cover different numbers of PROBLEMS. That is a coverage confound on top
+   of the thing you want to measure. `per_trace_budget=True` gives every
+   trace the same allowance, which makes the arms genuinely comparable.
 """
 
 from __future__ import annotations
@@ -39,8 +39,8 @@ from .base import Selector
 
 try:
     from ..analysis.stats import eb_shrink
-except ImportError:  # analysis package optional at import time
-    eb_shrink = None
+except ImportError:  # analysis is optional at import time
+    eb_shrink = None  # type: ignore
 
 
 class CausalSelector(Selector):
@@ -58,15 +58,15 @@ class CausalSelector(Selector):
         """
         Args:
             min_utility: Hard floor on the (shrunken) score. None means no
-                floor beyond drop_nonpositive. Avoid using this as the main
+                floor beyond `drop_nonpositive`. Avoid using this as the main
                 knob -- prefer the budget, which is what the baselines match.
-            top_k: Optional cap on number of selected messages.
+            top_k: Optional cap on selected messages.
             shrink: Rank by empirical-Bayes posterior mean rather than raw
                 delta. Requires per-message `se`; falls back to raw if absent.
             seed: Seed for random tie-breaking.
             per_trace_budget: Give each trace an equal share of the budget.
             drop_nonpositive: Exclude messages whose score is <= 0. A message
-                measured not to help is not training signal.
+                measured to not help is not training signal.
         """
         self.min_utility = min_utility
         self.top_k = top_k
@@ -78,23 +78,23 @@ class CausalSelector(Selector):
 
     def select(
         self,
-        traces: list,
-        utilities: dict,
+        traces: list[Any],
+        utilities: dict[tuple[str, str], float],
         token_budget: int,
-        ses: dict | None = None,
-    ) -> dict:
+        ses: dict[tuple[str, str], float] | None = None,
+    ) -> dict[str, list[str]]:
         rng = random.Random(self.seed)
 
         keys, raw, se_list, meta = [], [], [], []
         for trace in traces:
             trace_id = getattr(trace, "trace_id", getattr(trace, "pid", ""))
             for msg in trace.messages:
-                key = (trace_id, msg.mid)
-                if key not in utilities:
+                k = (trace_id, msg.mid)
+                if k not in utilities:
                     continue
-                keys.append(key)
-                raw.append(float(utilities[key]))
-                se_list.append(float((ses or {}).get(key, 0.0)))
+                keys.append(k)
+                raw.append(float(utilities[k]))
+                se_list.append(float((ses or {}).get(k, 0.0)))
                 meta.append((trace_id, msg.mid, self._estimate_tokens(msg.text)))
 
         if not keys:
@@ -122,10 +122,11 @@ class CausalSelector(Selector):
         if self.top_k is not None:
             cands = cands[: self.top_k]
 
-        selected: dict = {}
+        selected: dict[str, list[str]] = {}
         if self.per_trace_budget:
-            share = max(token_budget // max(len(traces), 1), 1)
-            used: dict = {}
+            n_traces = max(len(traces), 1)
+            share = max(token_budget // n_traces, 1)
+            used: dict[str, int] = {}
             for trace_id, mid, score, tokens, _ in cands:
                 if used.get(trace_id, 0) + tokens <= share:
                     selected.setdefault(trace_id, []).append(mid)
