@@ -1,22 +1,35 @@
-# Teacher model configuration - API-based DeepSeek
-# Used for generating debates on Colab (CPU)
+# Teacher model configuration.
+#
+# THIS FILE NOW DESCRIBES WHAT WAS ACTUALLY RUN. The previous version claimed
+# deepseek-v4-flash on api.deepseek.com at 2048 tokens; every artefact in
+# data/ was in fact produced by deepseek-v3.2 on generalcompute at 768 tokens.
+# A config that lies about the run is worse than no config, because the
+# mismatch is silent: you get numbers, they are just not comparable.
+#
+# Scripts still accept --model / --api-url / --max-tokens, and the CLI wins.
+# Passing them explicitly is the recommended habit; this file is the safety
+# net for when you forget.
 
 teacher:
-  # API Configuration
   provider: openai_compatible
-  base_url: https://api.deepseek.com/v1
-  model: deepseek-v4-flash
-  api_key_env: DEEPSEEK_API_KEY
-  
-  # Generation settings
+  base_url: https://api.generalcompute.com/v1
+  model: deepseek-v3.2
+  api_key_env: GC_API_KEY
+
   temperature: 0.7
-  max_tokens: 2048
+
+  # 768 is the ApiBackend constructor default. 01_generate_debates.py never
+  # passed max_tokens and DebateHarness forwards None, so every debate message
+  # was capped here. The 00a probe used the same default. Changing this number
+  # invalidates every cache entry and un-matches the audit arms. Do not touch
+  # it mid-project.
+  max_tokens: 768
   top_p: 0.95
-  
-  # Debate settings
+
+  # 6 generations per trace: r1.solver, r1.critic, r2.solver, r2.critic,
+  # r3.solver, r4.verifier. This is the number --n-sc must equal.
   max_rounds: 3
-  n_solutions_per_problem: 1
-  
-  # Caching
-  cache_dir: data/cache/teacher_api
+  n_solutions_per_problem: 3
+
+  cache_dir: /content/drive/MyDrive/cmd
   enable_cache: true

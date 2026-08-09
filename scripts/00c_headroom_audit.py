@@ -46,22 +46,39 @@ import yaml
 from src.backends.api import ApiBackend
 from src.debate.prompts import get_solve_prompt
 from src.analysis.stats import paired_bootstrap_ci, required_k
-from eval.grade import is_correct, extract_answer
+from eval.grade import is_correct, extract_answer, _normalize
 
 
 async def probe_problem(backend, question, gold, n, temperature):
     msgs = [{"role": "user", "content": get_solve_prompt(question)}]
-    outs = await backend.generate(msgs, n=n, temperature=temperature, cache_nonce="audit")
+    # No nonce. 00a probed these exact problems with this exact prompt at this
+    # exact k/temperature/max_tokens/model, so with the probe cache mounted
+    # every one of these is a cache HIT: free, instant, and guaranteed to be
+    # the same draws that defined the strata. A nonce would re-randomise and
+    # re-bill for nothing.
+    outs = await backend.generate(msgs, n=n, temperature=temperature)
     flags = [bool(is_correct(o, gold)) for o in outs]
     answers = [extract_answer(o) for o in outs]
     return (sum(flags) / max(len(flags), 1)), answers, flags
 
 
 def majority_vote(answers):
-    vals = [a for a in answers if a]
-    if not vals:
+    """Vote over NORMALISED answers.
+
+    Voting on raw strings splits the vote between textually different but
+    mathematically identical answers ('1/2' vs '0.5' vs '\\dfrac{1}{2}'), which
+    understates self-consistency. Since SC is the arm the debate must beat,
+    that bias would manufacture a passing gate. Normalise, then vote, then
+    return a raw representative for grading.
+    """
+    buckets = defaultdict(list)
+    for a in answers:
+        if a:
+            buckets[_normalize(str(a))].append(a)
+    if not buckets:
         return None
-    return Counter(vals).most_common(1)[0][0]
+    best = max(buckets.items(), key=lambda kv: len(kv[1]))
+    return best[1][0]
 
 
 def self_consistency_accuracy(answers, gold, n_sc, n_repeats, rng):
@@ -81,12 +98,20 @@ def self_consistency_accuracy(answers, gold, n_sc, n_repeats, rng):
 
 def load_debate_accuracy(path):
     """pid -> mean final_correct across all seeds for that pid."""
+    # 01_generate_debates.py writes a pretty-printed JSON ARRAY even though the
+    # filename ends in .jsonl. Parsing that line by line dies on the opening
+    # bracket. Sniff the first non-space character instead of trusting the
+    # extension.
+    raw = open(path).read()
+    stripped = raw.lstrip()
+    if stripped.startswith("["):
+        traces = json.loads(raw)
+    else:
+        traces = [json.loads(ln) for ln in raw.splitlines() if ln.strip()]
+
     per_pid = defaultdict(list)
     n_lines = 0
-    for line in open(path):
-        if not line.strip():
-            continue
-        t = json.loads(line)
+    for t in traces:
         pid = t.get("pid")
         if pid is None:
             continue
@@ -115,6 +140,18 @@ async def main():
                     help="Stratified pool from 00d. Do NOT pass gate_problems.json: "
                          "it is pre-filtered to headroom and destroys the contrast.")
     ap.add_argument("--config", default="configs/teacher_api_deepseek.yaml")
+    ap.add_argument("--model", default=None,
+                    help="OVERRIDES the config. Must be the SAME model that "
+                         "generated the traces, or the gate compares two "
+                         "different models and means nothing.")
+    ap.add_argument("--api-url", default=None, help="Overrides config base_url.")
+    ap.add_argument("--api-key", default=None, help="Literal key; overrides api_key_env.")
+    ap.add_argument("--max-tokens", type=int, default=768,
+                    help="Must equal the cap used by 01_generate_debates.py. "
+                         "ApiBackend defaults to 768 and the harness passes "
+                         "None, so the debate arm ran at 768. Using the "
+                         "config's 2048 here hands the baseline 2.7x the "
+                         "output budget AND breaks probe-cache reuse.")
     ap.add_argument("--traces", default=None, help="Debate traces jsonl. REQUIRED for arm C.")
     ap.add_argument("--n-probe", type=int, default=32)
     ap.add_argument("--n-sc", type=int, default=6,
@@ -130,6 +167,9 @@ async def main():
 
     rng = random.Random(args.seed)
     cfg = yaml.safe_load(open(args.config))
+    # The repo config nests everything under a top-level `teacher:` key, so
+    # cfg["model"] raises KeyError. Accept both the nested and flat shapes.
+    cfg = cfg.get("teacher", cfg)
     problems = json.load(open(args.problems))
     if args.limit:
         problems = problems[: args.limit]
@@ -149,11 +189,22 @@ async def main():
         print("scripts/00d_build_audit_pool.py first.")
         print(bang)
 
+    model = args.model or cfg.get("model")
+    base_url = args.api_url or cfg.get("base_url")
+    print("-" * 66)
+    print("arm A/B will be generated with:")
+    print("  model      : " + str(model))
+    print("  base_url   : " + str(base_url))
+    print("  max_tokens : " + str(args.max_tokens))
+    print("These MUST match 01_generate_debates.py or the gate is invalid.")
+    print("-" * 66)
+
     backend = ApiBackend(
-        model=cfg["model"],
-        base_url=cfg.get("base_url"),
-        api_key_env=cfg.get("api_key_env"),
-        max_tokens=cfg.get("max_tokens", 2048),
+        model=model,
+        base_url=base_url,
+        api_key=args.api_key,
+        api_key_env=None if args.api_key else cfg.get("api_key_env"),
+        max_tokens=args.max_tokens,
         cache_path=args.cache_path,
         concurrency=args.concurrency,
         extra_body={"thinking": {"type": "disabled"}},

@@ -26,6 +26,12 @@ def main():
     parser.add_argument("--max-rounds", type=int, default=3, help="Max debate rounds")
     parser.add_argument("--n-solutions", type=int, default=1, help="Solutions per problem")
     parser.add_argument("--cache-path", type=str, default="cache.jsonl", help="Path to API cache")
+    parser.add_argument("--max-tokens", type=int, default=1024,
+                        help="Output cap per message. The backend default of 768 "
+                             "truncated 67%% of messages and cost 9.5%% of solvers "
+                             "their final answer. The model context is 8192 total, "
+                             "and the verifier must fit 5 messages plus its own "
+                             "output, so this cannot go much above 1024.")
     args = parser.parse_args()
 
     # Load problems
@@ -46,6 +52,7 @@ def main():
         api_key=args.api_key,
         model=args.model,
         cache_path=args.cache_path,
+        max_tokens=args.max_tokens,
         supports_n=True,
         extra_body={"thinking": {"type": "disabled"}},  # hidden CoT breaks ablation
     )
@@ -54,6 +61,7 @@ def main():
     harness = DebateHarness(
         backend=backend,
         max_rounds=args.max_rounds,
+        max_tokens=args.max_tokens,
     )
 
     # Generate debates

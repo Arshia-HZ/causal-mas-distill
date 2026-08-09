@@ -113,7 +113,7 @@ def assert_parents_invariant(trace: Trace, prompt_of=None) -> None:
 # Hard input budget for the verifier prompt. The proxy caps deepseek-v3.2 at
 # 8192 TOTAL tokens (the advertised 32k does not apply); leave headroom for
 # output tokens. Estimated as chars // 4, matching the selectors' convention.
-VERIFIER_TOKEN_BUDGET = 7000
+VERIFIER_TOKEN_BUDGET = 5200
 
 
 def _clip_middle(text: str, cap: int) -> str:
@@ -159,12 +159,16 @@ def render_verifier_messages(
     
     out.append({"role": "user", "content": FINAL_INSTRUCTION})
     
-    est = sum(len(m["content"]) for m in out) // 4
+    # chars//4 is the selectors' convention, but it UNDERCOUNTS LaTeX,
+    # which tokenises closer to 3 chars/token. math_0498 was estimated
+    # under 7000 and still overflowed an 8192-token context at 8357.
+    # Budget at //3 so the estimate is conservative rather than optimistic.
+    est = sum(len(m["content"]) for m in out) // 3
     if est <= token_budget or not body_idx:
         return out
         
     fixed = sum(len(m["content"]) for i, m in enumerate(out) if i not in body_idx)
-    cap = max(600, (token_budget * 4 - fixed) // len(body_idx))
+    cap = max(600, (token_budget * 3 - fixed) // len(body_idx))
     for i in body_idx:
         header, _, text = out[i]["content"].partition("\n")
         out[i] = {"role": "user", "content": f"{header}\n{_clip_middle(text, cap)}"}
