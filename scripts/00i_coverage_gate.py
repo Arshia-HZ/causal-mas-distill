@@ -11,9 +11,19 @@
 #          --probed data/probed_all.json --gens-per-trace 6
 
 import argparse
-#!/usr/bin/env python3
 import json, re
+from math import comb
 from collections import Counter, defaultdict
+
+def pass_at_k(n, c, k):
+    """Unbiased pass@k (Chen et al. 2021) from c successes in n probe samples.
+    Assumption-free given exchangeable probe samples -- unlike 1-(1-p)^k."""
+    if k > n:
+        return 1.0 - (1.0 - c / n) ** k
+    if n - c < k:
+        return 1.0
+    return 1.0 - comb(n - c, k) / comb(n, k)
+
 
 def load_traces(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -86,6 +96,7 @@ def main():
     ap.add_argument("--traces", required=True)
     ap.add_argument("--probed", required=True)
     ap.add_argument("--gens-per-trace", type=int, default=6)
+    ap.add_argument("--n-probe", type=int, default=32)
     args = ap.parse_args()
 
     traces = load_traces(args.traces)
@@ -128,6 +139,9 @@ def main():
             "cov_dbg": cov_dbg,
             "cov_r1": any(agree(a, gold) for a in r1),
             "rs": 1.0 - (1.0 - p) ** budget,
+            "rsu": pass_at_k(args.n_probe,
+                             int(round(p * args.n_probe)), budget),
+            "rs3": 1.0 - (1.0 - p) ** len(ts),
         })
 
     if not rows:
@@ -138,15 +152,32 @@ def main():
     B = rows[0]["budget"]
     dbg = sum(1 for r in rows if r["cov_dbg"])
     rs = sum(r["rs"] for r in rows)
+    rsu = sum(r["rsu"] for r in rows)
     print("  problems matched        : %d" % n)
     print("  generations per problem : %d" % B)
     print(D)
     print("  debate coverage         : %d / %d  (%.1f%%)   MEASURED"
           % (dbg, n, 100.0 * dbg / n))
-    print("  rejection sampling @%-3d : %.1f / %d  (%.1f%%)   EXPECTED from probe"
+    print("  rejection sampling @%-3d : %.1f / %d  (%.1f%%)   binomial 1-(1-p)^k"
           % (B, rs, n, 100.0 * rs / n))
-    print("  advantage of debating   : %+.1f problems  (%+.1f pts)"
-          % (dbg - rs, 100.0 * (dbg - rs) / n))
+    print("  rejection sampling @%-3d : %.1f / %d  (%.1f%%)   UNBIASED pass@k"
+          % (B, rsu, n, 100.0 * rsu / n))
+    print("  advantage of debating   : %+.1f problems  (%+.1f pts)  vs unbiased"
+          % (dbg - rsu, 100.0 * (dbg - rsu) / n))
+    print(D)
+    print("  BASELINE VALIDITY CHECK -- is the extrapolation trustworthy?")
+    obs3 = sum(1 for r in rows if r["cov_r1"])
+    pre3 = sum(r["rs3"] for r in rows)
+    print("    observed coverage, 3 real round-1 samples : %d / %d  (%.1f%%)"
+          % (obs3, n, 100.0 * obs3 / n))
+    print("    same binomial model predicts              : %.1f / %d  (%.1f%%)"
+          % (pre3, n, 100.0 * pre3 / n))
+    gap = 100.0 * (pre3 - obs3) / n
+    print("    model overestimates real sampling by      : %+.1f pts" % gap)
+    if gap > 3.0:
+        print("    -> sampling failures ARE correlated; RS is optimistic.")
+    else:
+        print("    -> model calibrated at k=3; the RS numbers stand.")
 
     print(D)
     print("  BY DIFFICULTY BAND")
@@ -164,12 +195,12 @@ def main():
         if not sel:
             continue
         d = sum(1 for r in sel if r["cov_dbg"]) / len(sel)
-        s = sum(r["rs"] for r in sel) / len(sel)
+        s = sum(r["rsu"] for r in sel) / len(sel)
         mp = sum(r["p"] for r in sel) / len(sel)
         print("  %-12s %5d %8.3f %8.1f%% %8.1f%%"
               % (lab, len(sel), mp, 100.0 * d, 100.0 * s))
 
-    only = [r for r in rows if r["cov_dbg"] and r["rs"] < 0.5]
+    only = [r for r in rows if r["cov_dbg"] and r["rsu"] < 0.5]
     print(D)
     print("  DEBATE-ONLY WINS: solved by the debate, while rejection sampling")
     print("  at the same budget would find them less than half the time.")
@@ -179,10 +210,20 @@ def main():
               % (r["pid"], r["p"], B, r["rs"]))
 
     print(D)
-    if dbg - rs > 0.05 * n:
+    zero = [r for r in rows if r["p"] <= 0.0]
+    print("  WHY THIS POOL CANNOT BE WON:")
+    print("    %d of %d problems have probe p > 0, i.e. sampling ALREADY solved"
+          % (n - len(zero), n))
+    print("    them at least once in %d tries. A pool defined by 0 < p < 1"
+          % args.n_probe)
+    print("    GUARANTEES rejection sampling eventually succeeds on every item.")
+    print("    Problems with p == 0 in this pool: %d" % len(zero))
+    print("    -> the coverage claim can only be tested on p == 0 problems.")
+    print(D)
+    if dbg - rsu > 0.05 * n:
         print("  VERDICT: the debate reaches problems rejection sampling cannot")
         print("  at matched budget. The data engine is real. Proceed.")
-    elif dbg - rs > 0:
+    elif dbg - rsu > 0:
         print("  VERDICT: debate is ahead, but by less than 5 points. Weak.")
         print("  Get a harder pool before building on this.")
     else:

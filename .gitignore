@@ -129,3 +129,5 @@ wandb/
 graphify-out/
 .graphify*
 *.zip
+
+CLAUDE.md

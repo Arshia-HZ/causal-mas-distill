@@ -1,35 +1,35 @@
-# Teacher model configuration.
+# Teacher configuration.
 #
-# THIS FILE NOW DESCRIBES WHAT WAS ACTUALLY RUN. The previous version claimed
-# deepseek-v4-flash on api.deepseek.com at 2048 tokens; every artefact in
-# data/ was in fact produced by deepseek-v3.2 on generalcompute at 768 tokens.
-# A config that lies about the run is worse than no config, because the
-# mismatch is silent: you get numbers, they are just not comparable.
+# CORRECTED 2026-08-12.
+#   max_tokens was 768 while traces were actually generated at 1024.
+#   scripts/00c_headroom_audit.py reads THIS file, so the audit arms were
+#   silently generating under a different cap than the traces they are
+#   compared against. The old comment claiming 01_generate_debates.py never
+#   passes max_tokens has been false since that script was patched.
 #
-# Scripts still accept --model / --api-url / --max-tokens, and the CLI wins.
-# Passing them explicitly is the recommended habit; this file is the safety
-# net for when you forget.
+# Anything that changes a cache key is marked LOCKED. Changing a LOCKED value
+# invalidates cache_debates_v2.jsonl and costs real money on the next run.
 
 teacher:
   provider: openai_compatible
-  base_url: https://api.generalcompute.com/v1
-  model: deepseek-v3.2
+  base_url: https://api.generalcompute.com/v1   # LOCKED
+  model: deepseek-v3.2                          # LOCKED
   api_key_env: GC_API_KEY
 
-  temperature: 0.7
-
-  # 768 is the ApiBackend constructor default. 01_generate_debates.py never
-  # passed max_tokens and DebateHarness forwards None, so every debate message
-  # was capped here. The 00a probe used the same default. Changing this number
-  # invalidates every cache entry and un-matches the audit arms. Do not touch
-  # it mid-project.
-  max_tokens: 768
+  temperature: 0.7                              # LOCKED
+  max_tokens: 1024                              # LOCKED  (was 768)
   top_p: 0.95
 
-  # 6 generations per trace: r1.solver, r1.critic, r2.solver, r2.critic,
-  # r3.solver, r4.verifier. This is the number --n-sc must equal.
+  # Provider caps n per request at 8. The backend chunks larger n and folds
+  # the chunk index into the cache key.
+  max_n_per_request: 8
+
+  # Total context is 8192 tokens, prompt + completion. Not 32k.
+  context_limit: 8192
+
   max_rounds: 3
   n_solutions_per_problem: 3
 
   cache_dir: /content/drive/MyDrive/cmd
+  cache_file: cache_debates_v2.jsonl
   enable_cache: true

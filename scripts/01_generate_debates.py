@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--output", type=str, required=True, help="Output path for traces")
     parser.add_argument("--api-url", type=str, required=True, help="API base URL")
     parser.add_argument("--api-key", type=str, default=None, help="API key")
-    parser.add_argument("--model", type=str, default="deepseek-v4-flash", help="Model name")
+    parser.add_argument("--model", type=str, default="deepseek-v3.2", help="Model name")
     parser.add_argument("--max-rounds", type=int, default=3, help="Max debate rounds")
     parser.add_argument("--n-solutions", type=int, default=1, help="Solutions per problem")
     parser.add_argument("--cache-path", type=str, default="cache.jsonl", help="Path to API cache")

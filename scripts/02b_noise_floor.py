@@ -28,7 +28,7 @@ def main():
     parser.add_argument("--output", type=str, required=True, help="Output path for noise floor results")
     parser.add_argument("--api-url", type=str, required=True, help="API base URL")
     parser.add_argument("--api-key", type=str, default=None, help="API key")
-    parser.add_argument("--model", type=str, default="deepseek-v4-flash", help="Model name")
+    parser.add_argument("--model", type=str, default="deepseek-v3.2", help="Model name")
     parser.add_argument("--quantile", type=float, default=0.95, help="Quantile for noise floor threshold")
     parser.add_argument("--k", type=int, default=16, help="Samples per condition")
     parser.add_argument("--repeats", type=int, default=2, help="Number of placebo repeats")
