@@ -18,6 +18,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train student model")
     parser.add_argument("--dataset", type=str, required=True, help="Path to training dataset")
     parser.add_argument("--model", type=str, required=True, help="Base model name or path")
+    parser.add_argument("--config", type=str, default="configs/student_qwen2.5_1.5b.yaml", help="Path to config")
     parser.add_argument("--output-dir", type=str, required=True, help="Output directory for checkpoints")
     parser.add_argument("--epochs", type=int, default=3, help="Number of training epochs")
     parser.add_argument("--batch-size", type=int, default=4, help="Per-device batch size")
@@ -46,8 +47,8 @@ def main():
         pass
 
     # Load dataset
-    with open(args.dataset) as f:
-        examples = json.load(f)
+    with open(args.dataset, "r") as f:
+        examples = [json.loads(line) for line in f if line.strip()]
 
     print(f"Loaded {len(examples)} training examples")
 
@@ -62,6 +63,7 @@ def main():
         model_name_or_path=args.model,
         output_dir=out_dir,
         max_seq_length=args.max_seq_length,
+        config_path=args.config, # Now supported
     )
 
     # Train

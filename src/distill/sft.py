@@ -11,14 +11,9 @@ import torch
 from pathlib import Path
 from typing import Optional, Union
 
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    DataCollatorForCompletionOnlyLM,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import LoraConfig, get_peft_model
-from trl import SFTTrainer, SFTConfig
-
+from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 
 class DistillationTrainer:
     """
@@ -140,7 +135,7 @@ class DistillationTrainer:
         
         training_cfg = self.config.get("training", {})
         
-        # SFT config - T4 safe
+        # FIX: SFTConfig properly handles max_seq_length and packing now
         sft_cfg = SFTConfig(
             output_dir=str(self.output_dir),
             per_device_train_batch_size=training_cfg.get("per_device_train_batch_size", per_device_train_batch_size),
@@ -148,19 +143,18 @@ class DistillationTrainer:
             num_train_epochs=training_cfg.get("num_train_epochs", num_train_epochs),
             learning_rate=training_cfg.get("learning_rate", learning_rate),
             lr_scheduler_type=training_cfg.get("lr_scheduler_type", "cosine"),
-            warmup_ratio=training_cfg.get("warmup_ratio", warmup_ratio),
             fp16=training_cfg.get("fp16", self.dtype == torch.float16),
             bf16=training_cfg.get("bf16", self.dtype == torch.bfloat16),
             max_grad_norm=training_cfg.get("max_grad_norm", 1.0),
-            gradient_checkpointing=True,
             optim="adamw_torch_fused",
-            max_seq_length=max_len,
-            packing=False,
             logging_steps=10,
             save_steps=200,
             save_total_limit=2,
             seed=self.seed,
             report_to="none",
+            max_seq_length=max_len,  # Moved inside config
+            packing=False,           # Moved inside config
+            dataset_text_field="text"
         )
         
         # Response template for completion-only masking
@@ -204,7 +198,6 @@ class DistillationTrainer:
                 )
             output = self.tokenizer.decode(generated[0], skip_special_tokens=True)
             outputs.append(output)
-        
         return outputs
 
 
