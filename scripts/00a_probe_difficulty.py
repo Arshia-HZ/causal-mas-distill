@@ -13,7 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.backends.api import ApiBackend
+# from src.backends.api import ApiBackend
+from src.backends.multikey import MultiKeyApiBackend as ApiBackend
 from src.debate.prompts import get_solve_prompt
 from eval.grade import is_correct
 

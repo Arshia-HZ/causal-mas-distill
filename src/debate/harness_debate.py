@@ -102,12 +102,21 @@ class DebateHarness:
         temperature: float = 0.7,
         max_tokens: int | None = 1024,
         critic_persona: str = "default",
+        role_backends: dict | None = None,
     ):
         self.backend = backend
+        # role -> Backend. Missing roles fall back to `backend`.
+        # This is what makes the system genuinely multi-agent: the critic can
+        # be a DIFFERENT model from the solver, so its errors are not the same
+        # errors the solver already made.
+        self.role_backends = role_backends or {}
         self.max_rounds = max_rounds
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.critic_persona = critic_persona
+
+    def _be(self, role: str):
+        return self.role_backends.get(role, self.backend)
 
     def _system_for(self, role: str) -> str:
         if role == "critic" and self.critic_persona == "adversarial":
@@ -121,7 +130,7 @@ class DebateHarness:
             {"role": "system", "content": self._system_for(role)},
             {"role": "user", "content": user_prompt},
         ]
-        out = await self.backend.generate(
+        out = await self._be(role).generate(
             messages,
             n=1,
             temperature=self.temperature,
@@ -145,7 +154,7 @@ class DebateHarness:
             {"role": "system", "content": self._system_for("solver")},
             {"role": "user", "content": get_solve_prompt(question)},
         ]
-        seeds = await self.backend.generate(
+        seeds = await self._be("solver").generate(
             seed_msgs,
             n=n_solutions,
             temperature=self.temperature,
