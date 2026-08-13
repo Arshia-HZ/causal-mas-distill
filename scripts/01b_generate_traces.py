@@ -176,8 +176,7 @@ async def main_async(a: argparse.Namespace) -> int:
 
     print("\nwrote %d traces -> %s in %.1f min"
           % (written, a.output, (time.time() - t0) / 60.0))
-    print("NEXT: scripts/00f_check_traces.py then scripts/00g_diagnose_signal.py "
-          "BEFORE building any dataset.")
+    print("NEXT: scripts/00g_diagnose_signal.py BEFORE building any dataset.")
     return 0
 
 

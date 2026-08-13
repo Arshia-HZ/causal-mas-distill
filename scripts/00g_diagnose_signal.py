@@ -1,375 +1,373 @@
 #!/usr/bin/env python3
-"""00g_diagnose_signal.py  v2 -- ZERO API calls.
-
-v2 fixes a grader-mismatch bug in v1: v1 recomputed correctness with a weak
-built-in string matcher and then compared the result against probe pass rates
-that had been graded by eval/grade.py. That understated debate accuracy by
-several points. v2 uses eval.grade.is_correct whenever it can import it, and
-refuses to draw cross-grader conclusions when it cannot.
-
-Run from the repo root so that eval/ is importable:
-  python scripts/00g_diagnose_signal.py --traces data/traces.jsonl \
-      --max-tokens 1024 --probed data/probed_all.json
 """
-import argparse
-import json
-import os
-import re
-import sys
+00g_diagnose_signal.py (v3) -- pre-dataset quality gate for debate traces.
+
+WHY v3 (2026-08-14)
+-------------------
+v2 had two measurement bugs that together manufactured a fake "debate loses
+to a single sample" verdict on valid v3 data:
+
+1. CRITIC QUALITY used substring heuristics ("no factual error", "is correct",
+   ...) written for v1/v2 prompt style. rcr_v3 critiques are terse, derive
+   their own answer, and end in a machine-parseable `VERDICT:` line. They
+   almost never contain the old phrases, so v2 counted ~81% of critiques as
+   "flags" and produced a nonsense recall/precision table. v3 uses
+   parse_verdict() on the VERDICT line.
+
+2. THE GATE compared PER-TRACE debate accuracy against PER-PROBLEM probe
+   means. With stratified generation (1 seed for ceiling problems, 3 for the
+   rest), per-trace weighting over-represents hard problems 3-to-1 and
+   mechanically deflates the debate number. v3 reports both weightings and
+   re-weights the single-sample baseline to the same allocation.
+
+No API calls. Runs in seconds.
+
+    python scripts/00g_diagnose_signal.py \
+        --traces data/traces_v3.jsonl --probed data/probed_all.json
+"""
+import argparse, json, math, re, sys
 from collections import Counter, defaultdict
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(HERE)
-for p in (ROOT, os.getcwd()):
-    if p not in sys.path:
-        sys.path.insert(0, p)
 
-_grade = None
-GRADER = "builtin"
-try:
-    from eval.grade import is_correct as _grade
-    GRADER = "eval.grade.is_correct"
-except Exception:
-    pass
-
-HAVE_MV = False
-try:
-    import math_verify  # noqa: F401
-    HAVE_MV = True
-except Exception:
-    pass
+def load_rows(path):
+    raw = open(path, encoding='utf-8').read().strip()
+    if not raw:
+        return []
+    if raw[0] == '[':
+        return json.loads(raw)
+    return [json.loads(l) for l in raw.splitlines() if l.strip()]
 
 
-def load_traces(path):
-    with open(path, "r", encoding="utf-8") as f:
-        first = f.read(1)
-        f.seek(0)
-        if first == "[":
-            return json.load(f), "json-array"
-        rows = []
-        for line in f:
-            line = line.strip()
-            if line:
-                rows.append(json.loads(line))
-        return rows, "jsonl"
-
-
-def extract_boxed(text):
-    i = text.rfind("\\boxed")
-    if i < 0:
-        return None, False
-    j = text.find("{", i)
-    if j < 0:
-        return None, True
-    depth = 0
-    for k in range(j, len(text)):
-        if text[k] == "{":
-            depth += 1
-        elif text[k] == "}":
-            depth -= 1
-            if depth == 0:
-                return text[j + 1:k], False
-    return None, True
-
-
+# ---------------------------------------------------------------- graders
 def extract_answer(text):
-    """Returns (answer_or_None, was_cut_mid_box)."""
     if not text:
-        return None, False
-    val, cut = extract_boxed(text)
-    if val is not None:
-        return val, cut
-    hits = re.findall(r"####\s*(.+)", text)
-    if hits:
-        return hits[-1].strip(), cut
-    hits = re.findall(r"(?:final answer|the answer)\s*(?:is|:)\s*(.+)", text, re.I)
-    if hits:
-        return hits[-1].strip(), cut
-    return None, cut
+        return ''
+    m = list(re.finditer(r'\\boxed\{', text))
+    if m:
+        i = m[-1].end(); d = 1; j = i
+        while j < len(text) and d > 0:
+            if text[j] == '{': d += 1
+            elif text[j] == '}': d -= 1
+            j += 1
+        return text[i:j-1].strip()
+    m = re.search(r'####\s*(.+)', text)
+    if m:
+        return m.group(1).strip()
+    m = list(re.finditer(r'answer is[:\s]*(.+)', text, re.I))
+    return m[-1].group(1).strip().rstrip('.') if m else ''
 
 
-def norm(a):
-    if a is None:
-        return None
-    s = str(a).strip()
-    for junk in ("$", " ", "\\left", "\\right", "\\!", "\\,", "\\;"):
-        s = s.replace(junk, "")
-    s = re.sub(r"\\text\{([^}]*)\}", r"\1", s)
-    s = re.sub(r"\\mbox\{([^}]*)\}", r"\1", s)
-    for pre in ("\\dfrac", "\\tfrac"):
-        if s.startswith(pre):
-            s = "\\frac" + s[len(pre):]
-    s = s.rstrip(".").rstrip("$")
-    if s.endswith("%"):
-        s = s[:-1]
-    return s.lower()
+def _norm(s):
+    if not s:
+        return ''
+    s = str(s)
+    for a in (r'\!', r'\,', r'\;', r'\ ', r'\left', r'\right'):
+        s = s.replace(a, '')
+    s = s.replace('$', '').replace(' ', '').replace('\n', '')
+    for w in (r'\text', r'\mbox', r'\mathrm'):
+        s = re.sub(re.escape(w) + r'\{([^{}]*)\}', r'\1', s)
+    s = s.replace(r'\dfrac', r'\frac').replace(r'\tfrac', r'\frac')
+    s = re.sub(r'(?<=\d),(?=\d\d\d)', '', s)
+    return s.rstrip('.$%')
 
 
-def answers_agree(a, b):
-    """String-level agreement between two model answers. No gold involved,
-    so this is symmetric and grader-independent."""
-    na, nb = norm(a), norm(b)
-    if na is None or nb is None:
+def _agree_fallback(a, b):
+    a, b = _norm(a), _norm(b)
+    if not a or not b:
         return False
-    if na == nb:
+    if a == b:
         return True
     try:
-        return abs(float(na) - float(nb)) < 1e-6
+        return abs(float(a) - float(b)) < 1e-6
     except Exception:
         return False
 
 
-def correct(text, gold):
-    """Grade a raw message against gold using the strongest grader available."""
-    if text is None:
-        return False
-    if _grade is not None:
+try:  # prefer the repo grader when importable (math_verify-backed)
+    sys.path.insert(0, __file__.rsplit('/scripts/', 1)[0])
+    from eval.grade import is_correct as _grade_correct  # type: ignore
+    def agree(a, b):
         try:
-            return bool(_grade(text, gold))
+            return bool(_grade_correct(a, b))
         except Exception:
-            pass
-    a, _ = extract_answer(text)
-    return answers_agree(a, gold)
+            return _agree_fallback(a, b)
+    GRADER = 'eval.grade.is_correct'
+except Exception:
+    agree = _agree_fallback
+    GRADER = 'builtin normalizer (eval.grade not importable)'
 
 
-NO_ERROR = (
-    "no factual error", "no error", "is correct", "solution is correct",
-    "no mistakes", "looks correct", "no issues", "correct as written",
-    "i agree", "agree with the solution", "no corrections",
-)
+def parse_verdict(text):
+    """Local copy of src.debate.prompts.parse_verdict (kept import-free)."""
+    for line in reversed((text or '').strip().splitlines()):
+        s = line.strip().upper()
+        if s.startswith('VERDICT:'):
+            if 'DISPUTE' in s:
+                return 'dispute'
+            if 'AGREE' in s:
+                return 'agree'
+    return 'unparsed'
 
 
-def critic_says_clean(text):
-    t = (text or "").lower()
-    return any(k in t for k in NO_ERROR)
+def band_of(p):
+    if p >= 0.999:
+        return 'ceiling'
+    if p <= 0.001:
+        return 'floor'
+    return 'headroom'
 
 
-def msgs(t):
-    return t.get("messages") or []
-
-
-def pct(a, b):
-    return 0.0 if not b else 100.0 * a / b
-
-
+# ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--traces", required=True)
-    ap.add_argument("--max-tokens", type=int, default=1024)
-    ap.add_argument("--probed", default=None)
-    ap.add_argument("--dump-missing", type=int, default=0,
-                    help="print N round-2/3 solver messages that lack an answer")
-    ap.add_argument("--dump-critics", type=int, default=0,
-                    help="print N critic messages that missed a real error")
-    args = ap.parse_args()
+    ap.add_argument('--traces', required=True)
+    ap.add_argument('--probed', default=None)
+    ap.add_argument('--cap-tokens', type=int, default=4096,
+                    help='the max_completion_tokens the traces were generated '
+                         'with (NOT the stale 768). Drives the truncation heuristic.')
+    ap.add_argument('--chars-per-token', type=float, default=3.1)
+    a = ap.parse_args()
 
-    traces, fmt = load_traces(args.traces)
-    cap_chars = int(args.max_tokens * 3.6)
-    near = int(cap_chars * 0.92)
+    traces = load_rows(a.traces)
+    probed = {r['pid']: float(r.get('pass_rate', 0.0))
+              for r in load_rows(a.probed)} if a.probed else {}
 
-    bar = "=" * 66
-    dash = "-" * 66
-    print(bar)
-    print("SIGNAL DIAGNOSIS v2  (%d traces, %s)" % (len(traces), fmt))
-    print("grader                    : %s" % GRADER)
-    print("math_verify available     : %s" % HAVE_MV)
-    if _grade is None:
-        print("  !! eval.grade NOT importable. Run from the repo root.")
-        print("  !! Absolute accuracies below are NOT comparable to probe")
-        print("  !! pass rates, which were graded by eval/grade.py.")
-    print(bar)
+    print('=' * 66)
+    print('SIGNAL DIAGNOSIS v3  (%d traces)' % len(traces))
+    print('grader :', GRADER)
+    print('cap    : %d tokens (heuristic char cap = %d)'
+          % (a.cap_tokens, int(a.cap_tokens * a.chars_per_token)))
+    print('=' * 66)
 
-    # ---- 1. missing answers -------------------------------------------
-    miss_round = Counter()
-    miss_near = miss_short = miss_cut = 0
-    n_solver = 0
-    samples = []
+    # ---- completeness / truncation --------------------------------------
+    cap_chars = a.cap_tokens * a.chars_per_token
+    sol_noans = ver_noans = near_cap = n_msgs = 0
+    short_traces = []
     for t in traces:
-        for m in msgs(t):
-            if m.get("role") != "solver":
-                continue
-            n_solver += 1
-            a, cut = extract_answer(m.get("text") or "")
-            if m.get("answer"):
-                a = m["answer"]
-            if a is not None:
-                continue
-            txt = m.get("text") or ""
-            miss_round[m.get("round")] += 1
-            if len(txt) >= near:
-                miss_near += 1
-            else:
-                miss_short += 1
-                if len(samples) < args.dump_missing:
-                    samples.append((t.get("trace_id"), m.get("mid"), len(txt), txt))
-            if cut:
-                miss_cut += 1
+        msgs = t.get('messages', [])
+        n_msgs += len(msgs)
+        if len(msgs) < 6:
+            short_traces.append(t.get('trace_id', t.get('pid', '?')))
+        for m in msgs:
+            txt = m.get('text', '') or ''
+            if len(txt) > 0.95 * cap_chars:
+                near_cap += 1
+            if m.get('role') == 'solver' and not extract_answer(txt):
+                sol_noans += 1
+            if m.get('role') == 'verifier' and not extract_answer(txt):
+                ver_noans += 1
+    n_sol = sum(1 for t in traces for m in t.get('messages', [])
+                if m.get('role') == 'solver')
+    n_ver = sum(1 for t in traces for m in t.get('messages', [])
+                if m.get('role') == 'verifier')
+    print('COMPLETENESS')
+    print('  solver msgs with no answer  : %d/%d (%.1f%%)   [gate: <= 5%%]'
+          % (sol_noans, n_sol, 100 * sol_noans / max(1, n_sol)))
+    print('  verifier msgs with no answer: %d/%d (%.1f%%)   [gate: <= 1%%]'
+          % (ver_noans, n_ver, 100 * ver_noans / max(1, n_ver)))
+    print('  messages near %d-token cap   : %d/%d (%.1f%%)'
+          % (a.cap_tokens, near_cap, n_msgs, 100 * near_cap / max(1, n_msgs)))
+    print('  short traces (<6 msgs)      : %d   %s'
+          % (len(short_traces), '(resilient-retry degradation; builder drops them)'
+             if short_traces else ''))
+    print('-' * 66)
 
-    n_miss = sum(miss_round.values())
-    print("SOLVER MESSAGES WITH NO EXTRACTABLE ANSWER")
-    print("  total                   : %d / %d  (%.1f%%)"
-          % (n_miss, n_solver, pct(n_miss, n_solver)))
-    print("  by round                : %s" % dict(sorted(miss_round.items())))
-    print("  AT the char cap         : %d  (%.1f%% of missing)"
-          % (miss_near, pct(miss_near, n_miss)))
-    print("  well SHORT of the cap   : %d  (%.1f%% of missing)"
-          % (miss_short, pct(miss_short, n_miss)))
-    print("  cut off mid-\\boxed{}    : %d" % miss_cut)
-    if 1 not in miss_round and n_miss:
-        print("  => ZERO in round 1. The solve prompt is fine; the REVISION")
-        print("     prompt is what fails to demand a restated answer.")
-    for tid, mid, ln, txt in samples:
-        print("  " + dash)
-        print("  %s %s  (%d chars)" % (tid, mid, ln))
-        print("  ..." + txt[-600:].replace("\n", "\n  "))
-
-    # ---- 2. does the debate move the answer ---------------------------
-    print(dash)
-    print("DOES THE DEBATE MOVE THE ANSWER?  (same grader on both sides)")
-    cell = Counter()
-    changed = n_eval = skipped = 0
-    file_correct = 0
-    n_file = 0
+    # ---- seed independence -----------------------------------------------
+    by_pid = defaultdict(list)
     for t in traces:
-        gold = t.get("gold")
-        ms = msgs(t)
-        if t.get("final_correct") is not None:
-            n_file += 1
-            file_correct += 1 if t["final_correct"] else 0
-        solvers = [m for m in ms if m.get("role") == "solver"]
-        if not solvers:
+        by_pid[t['pid']].append(t)
+    multi = {p: ts for p, ts in by_pid.items() if len(ts) > 1}
+    ident = 0
+    for p, ts in multi.items():
+        r1 = [(m.get('text', '') or '').strip()
+              for t in ts
+              for m in t.get('messages', [])
+              if m.get('role') == 'solver' and m.get('round') == 1]
+        if len(r1) > 1 and len(set(r1)) < len(r1):
+            ident += 1
+    print('SEED INDEPENDENCE over %d multi-seed problems' % len(multi))
+    print('  problems with identical round-1 seeds: %d   [gate: 0]' % ident)
+    print('-' * 66)
+
+    # ---- structure (absorbs everything useful 00f_check_traces.py did) ----
+    msgs_hist = Counter()
+    roles = Counter()
+    for t in traces:
+        msgs_hist[len(t.get('messages', []))] += 1
+        for m in t.get('messages', []):
+            roles[m.get('role', '?')] += 1
+    seeds_hist = Counter(len(ts) for ts in by_pid.values())
+    spread = Counter()
+    for p, ts in by_pid.items():
+        accs = []
+        for t in ts:
+            af = t.get('final_answer') or ''
+            accs.append(bool(af) and agree(af, t.get('gold', '')))
+        spread[round(sum(accs) / len(accs), 3)] += 1
+    print('STRUCTURE')
+    print('  messages per trace :', dict(sorted(msgs_hist.items())))
+    print('  roles              :', dict(roles))
+    print('  seeds per problem  :', dict(sorted(seeds_hist.items())))
+    print('  per-pid acc spread :', dict(sorted(spread.items())))
+    print('-' * 66)
+
+    # ---- does the debate move the answer? (one grader both sides) --------
+    moved = rescued = broken = scored = 0
+    r1_ok = fin_ok = 0
+    for t in traces:
+        msgs = t.get('messages', [])
+        gold = t.get('gold', '')
+        r1 = next((m for m in msgs if m.get('role') == 'solver'
+                   and m.get('round') == 1), None)
+        if not r1:
             continue
-        first = solvers[0]
-        a1, _ = extract_answer(first.get("text") or "")
-        if a1 is None:
-            skipped += 1
+        a1 = extract_answer(r1.get('text', ''))
+        af = t.get('final_answer') or ''
+        if not a1 or not af:
             continue
-        fin = t.get("final_answer")
-        term = [m for m in ms if m.get("role") == "verifier"]
-        fin_text = term[-1].get("text") if term else None
-        if fin is None and fin_text:
-            fin, _ = extract_answer(fin_text)
-        n_eval += 1
-        if not answers_agree(a1, fin):
-            changed += 1
-        c1 = correct(first.get("text"), gold)
-        cf = t.get("final_correct")
-        if cf is None:
-            cf = correct(fin_text, gold)
-        cell[(bool(c1), bool(cf))] += 1
+        scored += 1
+        c1 = agree(a1, gold)
+        cf = agree(af, gold)
+        r1_ok += c1
+        fin_ok += cf
+        if _norm(a1) != _norm(af):
+            moved += 1
+            if cf and not c1:
+                rescued += 1
+            elif c1 and not cf:
+                broken += 1
+    print('DOES THE DEBATE MOVE THE ANSWER?  (re-graded, one grader)')
+    print('  traces scored     :', scored)
+    print('  moved             : %d (%.1f%%)' % (moved, 100 * moved / max(1, scored)))
+    print('  rescued / broken  : %d / %d   (net %+d)   [gate: rescue >= 2x broken]'
+          % (rescued, broken, rescued - broken))
+    print('  r1 acc -> final   : %.3f -> %.3f  (%+.3f)'
+          % (r1_ok / max(1, scored), fin_ok / max(1, scored),
+             (fin_ok - r1_ok) / max(1, scored)))
+    file_fc = sum(1 for t in traces if t.get('final_correct'))
+    print('  file-recorded final_correct: %.3f  (informational)'
+          % (file_fc / max(1, len(traces))))
+    print('-' * 66)
 
-    r1_acc = (cell[(True, True)] + cell[(True, False)]) / max(1, n_eval)
-    fin_acc = (cell[(True, True)] + cell[(False, True)]) / max(1, n_eval)
-    print("  traces scored            : %d  (skipped %d)" % (n_eval, skipped))
-    print("  final != round-1 answer  : %d  (%.1f%%)" % (changed, pct(changed, n_eval)))
-    print("  round-1 solver accuracy  : %.3f" % r1_acc)
-    print("  final accuracy           : %.3f" % fin_acc)
-    print("  delta from debating      : %+.3f   <- ROBUST, one grader" % (fin_acc - r1_acc))
-    print("  rescued (wrong -> right) : %d" % cell[(False, True)])
-    print("  broken  (right -> wrong) : %d" % cell[(True, False)])
-    net = cell[(False, True)] - cell[(True, False)]
-    print("  net                      : %+d traces" % net)
-    if n_file:
-        print("  file-recorded final_correct: %.3f  (%d traces, grade.py at"
-              % (file_correct / n_file, n_file))
-        print("                               generation time)")
-
-    # ---- 3. critic quality --------------------------------------------
-    print(dash)
-    print("CRITIC QUALITY  (does it catch REAL errors?)")
-    cm = Counter()
-    by_round = defaultdict(Counter)
-    crit_samples = []
+    # ---- critic quality via VERDICT lines --------------------------------
+    crit = Counter()
     for t in traces:
-        gold = t.get("gold")
-        ms = msgs(t)
-        pos = {m.get("mid"): m for m in ms}
-        for m in ms:
-            if m.get("role") != "critic":
+        msgs = t.get('messages', [])
+        gold = t.get('gold', '')
+        for i, m in enumerate(msgs):
+            if m.get('role') != 'critic':
                 continue
-            rnd = m.get("round")
-            target = pos.get("r%s.solver" % rnd)
-            if target is None:
+            prev = next((mm for mm in reversed(msgs[:i])
+                         if mm.get('role') == 'solver'), None)
+            if not prev:
                 continue
-            ta, _ = extract_answer(target.get("text") or "")
-            if ta is None:
+            wrong = not agree(extract_answer(prev.get('text', '')), gold)
+            v = parse_verdict(m.get('text', ''))
+            crit['n'] += 1
+            crit[v] += 1
+            if v in ('dispute', 'agree'):
+                key = ('wrong' if wrong else 'right') + '_' + v
+                crit[key] += 1
+    n_c = max(1, crit['n'])
+    recall = crit['wrong_dispute'] / max(1, crit['wrong_dispute'] + crit['wrong_agree'])
+    precision = crit['wrong_dispute'] / max(1, crit['wrong_dispute'] + crit['right_dispute'])
+    print('CRITIC QUALITY  (VERDICT-line based)')
+    print('  critiques scored  :', crit['n'])
+    print('  dispute / agree / unparsed : %d / %d / %d  (unparsed %.1f%%  [warn if >10%%])'
+          % (crit['dispute'], crit['agree'], crit['unparsed'],
+             100 * crit['unparsed'] / n_c))
+    print('  solver WRONG, disputed (recall)    : %d/%d = %.3f   [gate: >= 0.30]'
+          % (crit['wrong_dispute'],
+             crit['wrong_dispute'] + crit['wrong_agree'], recall))
+    print('  precision when disputing           : %d/%d = %.3f'
+          % (crit['wrong_dispute'],
+             crit['wrong_dispute'] + crit['right_dispute'], precision))
+    print('-' * 66)
+
+    # ---- the honest debate-vs-single-sample comparison -------------------
+    print('DEBATE vs SINGLE SAMPLE  (like-for-like weightings)')
+    if probed:
+        bands = defaultdict(lambda: dict(pids=0, traces=0, p_sum=0.0,
+                                         deb_pid=[], deb_tr=[]))
+        for p, ts in by_pid.items():
+            if p not in probed:
                 continue
-            wrong = not correct(target.get("text"), gold)
-            clean = critic_says_clean(m.get("text") or "")
-            cm[(wrong, clean)] += 1
-            by_round[rnd]["clean" if clean else "flags"] += 1
-            if wrong and clean and len(crit_samples) < args.dump_critics:
-                crit_samples.append((t.get("trace_id"), m.get("mid"), gold,
-                                     ta, m.get("text") or ""))
+            b = band_of(probed[p])
+            d = bands[b]
+            d['pids'] += 1
+            d['p_sum'] += probed[p]
+            d['traces'] += len(ts)
+            accs = []
+            for t in ts:
+                af = t.get('final_answer') or ''
+                c = bool(af) and agree(af, t.get('gold', ''))
+                d['deb_tr'].append(c)
+                accs.append(c)
+            d['deb_pid'].append(sum(accs) / len(accs))
 
-    tp, fn = cm[(True, False)], cm[(True, True)]
-    fp, tn = cm[(False, False)], cm[(False, True)]
-    tot = tp + fn + fp + tn
-    print("  judgements scored        : %d" % tot)
-    print("  solver WRONG, flagged    : %d" % tp)
-    print("  solver WRONG, said fine  : %d   <- missed errors" % fn)
-    print("  solver RIGHT, flagged    : %d   <- false alarms" % fp)
-    print("  solver RIGHT, said fine  : %d" % tn)
-    if tp + fn:
-        print("  RECALL on real errors    : %.3f" % (tp / (tp + fn)))
-    if tp + fp:
-        print("  PRECISION when flagging  : %.3f" % (tp / (tp + fp)))
-    print("  flag rate                : %.1f%%" % pct(tp + fp, tot))
-    print("  verdicts by round        : %s"
-          % {k: dict(v) for k, v in sorted(by_round.items())})
-    if _grade is None:
-        print("  !! recall is biased LOW without grade.py: correct answers")
-        print("  !! misgraded as wrong land in the 'missed errors' cell.")
-    for tid, mid, gold, ta, txt in crit_samples:
-        print("  " + dash)
-        print("  %s %s   gold=%s solver_said=%s" % (tid, mid, gold, ta))
-        print("  " + txt[:700].replace("\n", "\n  "))
+        hdr = '%-9s %5s %6s | %7s %8s | %8s %8s' % (
+            'band', 'pids', 'traces', 'RS/pid', 'deb/pid', 'RS/trc*', 'deb/trc')
+        print(' ', hdr)
+        print(' ', '-' * (len(hdr) + 1))
+        tot = dict(pids=0, traces=0, p_sum=0.0, dp=[], dt=[], wrs=0.0)
+        for b in ('ceiling', 'headroom', 'floor'):
+            d = bands.get(b)
+            if not d or not d['pids']:
+                continue
+            rs_pid = d['p_sum'] / d['pids']
+            deb_pid = sum(d['deb_pid']) / len(d['deb_pid'])
+            rs_tr = sum(probed[p] * len(by_pid[p]) for p in by_pid
+                        if p in probed and band_of(probed[p]) == b) / d['traces']
+            deb_tr = sum(d['deb_tr']) / len(d['deb_tr'])
+            print('  %-9s %5d %6d | %7.3f %8.3f | %8.3f %8.3f'
+                  % (b, d['pids'], d['traces'], rs_pid, deb_pid, rs_tr, deb_tr))
+            tot['pids'] += d['pids']; tot['traces'] += d['traces']
+            tot['p_sum'] += d['p_sum']; tot['dp'] += d['deb_pid']
+            tot['dt'] += d['deb_tr']
+            tot['wrs'] += sum(probed[p] * len(by_pid[p]) for p in by_pid
+                              if p in probed and band_of(probed[p]) == b)
+        print(' ', '-' * (len(hdr) + 1))
+        print('  %-9s %5d %6d | %7.3f %8.3f | %8.3f %8.3f' % (
+            'ALL', tot['pids'], tot['traces'],
+            tot['p_sum'] / max(1, tot['pids']),
+            sum(tot['dp']) / max(1, len(tot['dp'])),
+            tot['wrs'] / max(1, tot['traces']),
+            sum(tot['dt']) / max(1, len(tot['dt']))))
+        print('  * RS/trc re-weights single-sample accuracy to the SAME 1-vs-3')
+        print('    seed allocation as the trace file. v2 skipped this and')
+        print('    manufactured a fake "debate loses" verdict.')
+        cov = sum(1 for p, ts in by_pid.items()
+                  if any((t.get('final_answer') or '') and
+                         agree(t['final_answer'], t.get('gold', '')) for t in ts))
+        print('  coverage (pids with >=1 correct trace): %d/%d   [gate: >= 600]'
+              % (cov, len(by_pid)))
+    else:
+        print('  (no --probed file; skipping baseline comparison)')
+        cov = 0
+    print('=' * 66)
 
-    # ---- 4. gate preview ---------------------------------------------
-    if args.probed:
-        print(dash)
-        print("FREE GATE PREVIEW (probe data, no API calls)")
-        try:
-            with open(args.probed, "r", encoding="utf-8") as f:
-                probed = json.load(f)
-            rate = {}
-            for p in probed:
-                pid = p.get("pid") or p.get("id")
-                if pid is not None and p.get("pass_rate") is not None:
-                    rate[pid] = float(p["pass_rate"])
-            pids = sorted({t.get("pid") for t in traces})
-            ps = [rate[p] for p in pids if p in rate]
-            if ps:
-                mean_p = sum(ps) / len(ps)
-                at3 = sum(1.0 - (1.0 - p) ** 3 for p in ps) / len(ps)
-                at6 = sum(1.0 - (1.0 - p) ** 6 for p in ps) / len(ps)
-                dbg = (file_correct / n_file) if n_file else fin_acc
-                lo = min(ps)
-                hi = max(ps)
-                print("  problems matched         : %d / %d" % (len(ps), len(pids)))
-                print("  probe pass rate range    : %.3f .. %.3f" % (lo, hi))
-                print("  arm A, single sample     : %.3f" % mean_p)
-                print("  pass@3 UPPER bound       : %.3f" % at3)
-                print("  pass@6 UPPER bound       : %.3f   <- SC@6 ceiling" % at6)
-                print("  debate, grade.py         : %.3f" % dbg)
-                print("  debate - single          : %+.3f" % (dbg - mean_p))
-                if mean_p > 0.65:
-                    print("  !! mean pass rate %.3f means this 'headroom' set is" % mean_p)
-                    print("  !! mostly near-ceiling problems. A band of 0<p<1 at")
-                    print("  !! k=32 admits p=31/32. Re-band before concluding.")
-                if dbg > at6:
-                    print("  => debate beats the pass@6 ceiling. Strong. Run 00c.")
-                elif dbg > mean_p:
-                    print("  => debate beats 1 sample but sits far below the")
-                    print("     pass@6 ceiling. 00c must arbitrate vs SC@6.")
-                else:
-                    print("  => debate at or below a single sample.")
-        except Exception as e:
-            print("  could not read --probed: %s: %s" % (type(e).__name__, e))
-
-    print(bar)
-    return 0
+    # ---- gate ------------------------------------------------------------
+    checks = [
+        ('coverage >= 600 pids', cov >= 600 if probed else None),
+        ('solver answerless <= 5%', sol_noans / max(1, n_sol) <= 0.05),
+        ('verifier answerless <= 1%', ver_noans / max(1, n_ver) <= 0.01),
+        ('verdicts parsed >= 90%', crit['unparsed'] / n_c <= 0.10),
+        ('seeds independent', ident == 0),
+        ('rescue >= 2x broken', rescued >= 2 * max(1, broken)),
+        ('critic recall >= 0.30', recall >= 0.30),
+    ]
+    print('GATE')
+    ok = True
+    for name, res in checks:
+        if res is None:
+            print('  [skip]', name); continue
+        print('  [%s] %s' % ('PASS' if res else 'FAIL', name))
+        ok = ok and res
+    print()
+    print('VERDICT:', 'GO -- build Arm A, then A/B/C, then dry-run, then train.'
+          if ok else
+          'NO-GO -- fix the failing check BEFORE spending GPU hours.')
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    main()
