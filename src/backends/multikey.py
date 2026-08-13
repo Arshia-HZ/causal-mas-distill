@@ -157,13 +157,13 @@ class MultiKeyApiBackend:
         if self.supports_n:
             r = await client.chat.completions.create(
                 model=self.model, messages=messages, n=n,
-                temperature=temperature, max_tokens=max_tokens,
+                temperature=temperature, max_completion_tokens=max_tokens,
                 extra_body=self.extra_body)
             return [c.message.content for c in r.choices]
         outs = await asyncio.gather(*[
             client.chat.completions.create(
                 model=self.model, messages=messages, n=1,
-                temperature=temperature, max_tokens=max_tokens,
+                temperature=temperature, max_completion_tokens=max_tokens,
                 extra_body=self.extra_body)
             for _ in range(n)])
         return [o.choices[0].message.content for o in outs]

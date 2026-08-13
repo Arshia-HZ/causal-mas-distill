@@ -87,7 +87,7 @@ class ApiBackend:
                         messages=messages,
                         n=n,
                         temperature=temperature,
-                        max_tokens=max_tokens,
+                        max_completion_tokens=max_tokens,
                         extra_body=self.extra_body,
                     )
                     return [c.message.content for c in r.choices]
@@ -99,7 +99,7 @@ class ApiBackend:
                         messages=messages,
                         n=1,
                         temperature=temperature,
-                        max_tokens=max_tokens,
+                        max_completion_tokens=max_tokens,
                         extra_body=self.extra_body,
                     )
                     for _ in range(n)
