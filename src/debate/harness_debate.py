@@ -66,7 +66,7 @@ except ImportError:
 # Total characters of transcript we are willing to put in a prompt. The teacher
 # context is 8192 tokens; math text runs near 3 chars/token, so 8192 tokens is
 # roughly 24000 chars. Leave room for the instruction block and the completion.
-TRANSCRIPT_CHAR_BUDGET = 12000
+TRANSCRIPT_CHAR_BUDGET = 24000
 
 
 def _clip(text: str, limit: int) -> str:
@@ -139,6 +139,44 @@ class DebateHarness:
         )
         return out[0] if out else ""
 
+    OVERFLOW = ("max_len", "context", "too long", "maximum context",
+                "only supports", "reduce the length")
+
+    async def _gen_resilient(self, role: str, prompt_for, nonce: str,
+                             trace: Trace) -> str:
+        """
+        Retry with a shrinking transcript on context overflow, for EVERY role.
+
+        Previously only the verifier had this protection (_verify_with_retry).
+        Now that max_completion_tokens actually binds at 4096 and the
+        transcript budget is 12000 chars (~3900 tokens), a late-round critic
+        or revision prompt can total prompt ~4300 + completion 4096 > 8192.
+        Without this retry the exception escapes to run_parallel and the
+        WHOLE trace is dropped -- the failure that killed math_0498 and
+        math_0787 in earlier runs. With it, the trace degrades gracefully:
+        the offending turn is clipped or, after 4 failures, skipped, and the
+        debate continues.
+
+        prompt_for: callable taking a char budget and returning the user
+        prompt rendered with that budget.
+        """
+        budget = TRANSCRIPT_CHAR_BUDGET
+        last_err = None
+        for attempt in range(4):
+            try:
+                return await self._gen(
+                    role, prompt_for(budget),
+                    nonce="%s|a%d" % (nonce, attempt),
+                )
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                if not any(t in str(e).lower() for t in self.OVERFLOW):
+                    raise
+                budget = int(budget * 0.65)
+        print("WARN %s: %s failed after retries: %s"
+              % (trace.trace_id, role, last_err))
+        return ""
+
     async def run(self, pid: str, question: str, gold: str,
                   n_solutions: int = 1) -> list[Trace]:
         """
@@ -196,34 +234,40 @@ class DebateHarness:
         ))
 
         # Alternating critique / revision. Both see the full transcript.
+        # The transcript is rendered inside _gen_resilient so it can shrink on
+        # context overflow; `parents` still covers everything said so far.
         for rnd in range(1, self.max_rounds):
-            transcript = render_transcript(trace.messages)
             parents = [m.mid for m in trace.messages]
 
             cmid = "r%d.critic" % rnd
-            ctext = await self._gen(
+            ctext = await self._gen_resilient(
                 "critic",
-                get_critique_prompt(question, transcript=transcript),
+                lambda b: get_critique_prompt(
+                    question, transcript=render_transcript(trace.messages, b)),
                 nonce="%s|%s" % (trace_id, cmid),
+                trace=trace,
             )
-            trace.messages.append(Message(
-                mid=cmid, round=rnd, role="critic", text=ctext,
-                answer=extract_answer(ctext), parents=parents,
-            ))
+            if ctext:  # a failed turn is skipped, not stored as an empty message
+                trace.messages.append(Message(
+                    mid=cmid, round=rnd, role="critic", text=ctext,
+                    answer=extract_answer(ctext), parents=parents,
+                ))
 
-            transcript = render_transcript(trace.messages)
             parents = [m.mid for m in trace.messages]
 
             smid = "r%d.solver" % (rnd + 1)
-            stext = await self._gen(
+            stext = await self._gen_resilient(
                 "solver",
-                get_revision_prompt(question, transcript=transcript),
+                lambda b: get_revision_prompt(
+                    question, transcript=render_transcript(trace.messages, b)),
                 nonce="%s|%s" % (trace_id, smid),
+                trace=trace,
             )
-            trace.messages.append(Message(
-                mid=smid, round=rnd + 1, role="solver", text=stext,
-                answer=extract_answer(stext), parents=parents,
-            ))
+            if stext:  # keep the previous solver answer alive instead of an empty turn
+                trace.messages.append(Message(
+                    mid=smid, round=rnd + 1, role="solver", text=stext,
+                    answer=extract_answer(stext), parents=parents,
+                ))
 
         # Verifier reads everything and decides.
         vmid = "r%d.verifier" % (self.max_rounds + 1)
@@ -246,29 +290,14 @@ class DebateHarness:
         return trace
 
     async def _verify_with_retry(self, question: str, trace: Trace, vmid: str) -> str:
-        """
-        Shrink the transcript on context-overflow errors instead of losing the
-        trace. Two problems were lost to overflow in the previous run.
-        """
-        overflow = ("max_len", "context", "too long", "maximum context",
-                    "only supports", "reduce the length")
-        budget = TRANSCRIPT_CHAR_BUDGET
-        last_err = None
-        for attempt in range(4):
-            transcript = render_transcript(trace.messages, budget=budget)
-            try:
-                return await self._gen(
-                    "verifier",
-                    get_verify_prompt(question, transcript),
-                    nonce="%s|%s|a%d" % (trace.trace_id, vmid, attempt),
-                )
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                if not any(t in str(e).lower() for t in overflow):
-                    raise
-                budget = int(budget * 0.65)
-        print("WARN %s: verifier failed after retries: %s" % (trace.trace_id, last_err))
-        return ""
+        """Thin wrapper; the overflow-retry logic lives in _gen_resilient."""
+        return await self._gen_resilient(
+            "verifier",
+            lambda b: get_verify_prompt(
+                question, render_transcript(trace.messages, b)),
+            nonce="%s|%s" % (trace.trace_id, vmid),
+            trace=trace,
+        )
 
     async def run_parallel(self, problems: list[dict], n_solutions: int = 1,
                            concurrency: int = 8) -> list[Trace]:
