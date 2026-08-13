@@ -76,7 +76,14 @@ class MultiKeyApiBackend:
         api_key: str | None = None,
         api_key_env: str | None = None,
         concurrency: int | None = None,
+        token_param: str = "max_completion_tokens",
+        merge_system: bool | None = None,
     ):
+        self.token_param = token_param
+        # Gemma has no system role in its chat template.
+        self.merge_system = (
+            merge_system if merge_system is not None
+            else "gemma" in model.lower())
         if concurrency is not None:
             # ApiBackend's `concurrency` was global; here it is per key.
             concurrency_per_key = max(1, int(concurrency))
@@ -153,18 +160,43 @@ class MultiKeyApiBackend:
             self._rr += 1
         return i
 
+    def _prep(self, messages):
+        """Gemma chat templates have no `system` role. Most providers 400 on it,
+        some silently drop it, which is worse. Merge it into the first user
+        turn so the critic actually receives its role instructions."""
+        if not self.merge_system:
+            return messages
+        sys_txt = "\n\n".join(
+            m["content"] for m in messages if m.get("role") == "system")
+        rest = [m for m in messages if m.get("role") != "system"]
+        if not sys_txt:
+            return messages
+        if rest and rest[0].get("role") == "user":
+            rest = [{"role": "user",
+                     "content": sys_txt + "\n\n" + rest[0]["content"]}] + rest[1:]
+        else:
+            rest = [{"role": "user", "content": sys_txt}] + rest
+        return rest
+
+    def _kw(self, messages, n, temperature, max_tokens):
+        kw = dict(model=self.model, messages=self._prep(messages), n=n,
+                  temperature=temperature)
+        # GeneralCompute ignores `max_tokens` outright: the cap never binds and
+        # you find out months later when 47% of messages blew past it.
+        # `max_completion_tokens` is the parameter it actually reads.
+        kw[self.token_param] = max_tokens
+        if self.extra_body:
+            kw["extra_body"] = self.extra_body
+        return kw
+
     async def _call(self, client, messages, n, temperature, max_tokens):
         if self.supports_n:
             r = await client.chat.completions.create(
-                model=self.model, messages=messages, n=n,
-                temperature=temperature, max_completion_tokens=max_tokens,
-                extra_body=self.extra_body)
+                **self._kw(messages, n, temperature, max_tokens))
             return [c.message.content for c in r.choices]
         outs = await asyncio.gather(*[
             client.chat.completions.create(
-                model=self.model, messages=messages, n=1,
-                temperature=temperature, max_completion_tokens=max_tokens,
-                extra_body=self.extra_body)
+                **self._kw(messages, 1, temperature, max_tokens))
             for _ in range(n)])
         return [o.choices[0].message.content for o in outs]
 
@@ -178,8 +210,30 @@ class MultiKeyApiBackend:
                                            temperature, max_tokens)
                 self.calls[i] += 1
                 return out
-            except BadRequestError:
-                raise  # 400 never heals: context overflow, bad params
+            except BadRequestError as e:
+                msg = str(e).lower()
+                # A 400 for an unsupported parameter DOES heal: drop it once
+                # and retry. Otherwise a deepseek-only extra_body kills the
+                # whole run the moment the critic is a different model.
+                if self.extra_body and any(
+                        t in msg for t in ("extra_body", "unknown", "unsupported",
+                                           "unrecognized", "thinking", "not supported")):
+                    print("[multikey:%s] provider rejected extra_body %r, "
+                          "dropping it and retrying" % (self.model, self.extra_body))
+                    self.extra_body = {}
+                    continue
+                if (self.token_param == "max_completion_tokens"
+                        and "max_completion_tokens" in msg):
+                    print("[multikey:%s] provider rejected max_completion_tokens, "
+                          "falling back to max_tokens" % self.model)
+                    self.token_param = "max_tokens"
+                    continue
+                if not self.merge_system and "system" in msg and "role" in msg:
+                    print("[multikey:%s] provider rejected the system role, "
+                          "merging it into the user turn" % self.model)
+                    self.merge_system = True
+                    continue
+                raise  # a real 400: context overflow, bad model name
             except Exception as e:
                 last = e
                 if _looks_rate_limited(e):
