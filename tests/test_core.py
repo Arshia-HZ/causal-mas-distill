@@ -210,7 +210,7 @@ def test_selection_is_per_trace_and_arms_are_matched():
 
 
 def test_harness_generates_valid_trace():
-    from src.debate.harness import DebateHarness
+    from src.debate.harness_debate import DebateHarness
     b = MockBackend(gold="42")
     harness = DebateHarness(b, max_rounds=2)
     traces = asyncio.run(harness.run("test1", "What is the answer?", "42", n_solutions=1))

@@ -113,21 +113,76 @@ def render_transcript(trace, clip_critic=0, max_round=0):
     return "\n\n".join(parts)
 
 
+# --- answer agreement helpers (for Arm C turn selection) ------------------
+import re as _re
+
+try:
+    from eval.grade import is_correct as _grade_correct
+except Exception:
+    _grade_correct = None
+
+
+def _norm_ans(s):
+    s = (s or "").strip()
+    for a in (r"\!", r"\,", r"\;", r"\ ", r"\left", r"\right"):
+        s = s.replace(a, "")
+    s = s.replace("$", "").replace(" ", "").replace("\n", "")
+    s = s.replace(r"\dfrac", r"\frac").replace(r"\tfrac", r"\frac")
+    s = _re.sub(r"(?<=\d),(?=\d\d\d)", "", s)
+    return s.rstrip(".$%")
+
+
+def agree_ans(a, b):
+    """Cheap answer agreement. Strong enough here because the trace's final
+    answer was already verified against gold (final_correct gate upstream);
+    we only need to know which solver turn CARRIES that answer."""
+    if _grade_correct is not None:
+        try:
+            return bool(_grade_correct(a, b))
+        except Exception:
+            pass
+    a, b = _norm_ans(a), _norm_ans(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    try:
+        return abs(float(a) - float(b)) < 1e-6
+    except Exception:
+        return False
+
+
 def render_final_solution(trace):
     """
-    Arm C. The last solver turn that actually carries an answer -- i.e. the
-    solution the debate converged on, with every critique stripped out.
-    Returns "" when no solver turn has an answer (9.2% of round 2-3 solvers
-    are answerless in the v1 traces).
+    Arm C. The debate's final solution as a COMPLETE derivation, with every
+    critique stripped out.
+
+    v2 fix (2026-08-14): "the last solver turn with an answer" is wrong under
+    the rcr_v3 prompts. When the critic agrees (~94% of critiques), the last
+    solver turn is a short confirmation ("The final answer remains
+    \\boxed{X}") -- measured mean 138 tokens, 0.15x of Arm A, with no
+    reasoning to distill. Pick instead the LONGEST solver turn whose answer
+    agrees with the trace's final answer: when the critic agreed, that is
+    the round-1 full derivation; when a dispute led to a fix, it is the
+    correcting revision. Returns "" when no solver turn carries the final
+    answer (verifier-only rescues, ~2%), so that problem drops out of C --
+    and therefore out of the shared set, keeping T11 coverage matching
+    intact rather than training on a wrong answer.
     """
+    final = (trace.get("final_answer") or "").strip()
     best = ""
     for m in trace.get("messages", []):
         if m.get("role") != "solver":
             continue
-        if not (m.get("answer") or ""):
-            continue
         t = (m.get("text") or "").strip()
-        if t:
+        if not t:
+            continue
+        ans = (m.get("answer") or "").strip()
+        if not ans:
+            continue
+        if final and not agree_ans(ans, final):
+            continue
+        if len(t) > len(best):
             best = t
     return best
 
@@ -333,9 +388,9 @@ def main():
         print("FAIL: arms differ by more than 1% of completion tokens.")
         sys.exit(3)
     if max(covs) > 0 and min(covs) / max(covs) < 0.75:
-        print("FAIL: problem coverage differs by more than 25% across arms "
-              "(%s). This is exactly the 2026-08-13 failure. Use the _eqp "
-              "datasets as primary." % covs)
+        print(f"FAIL: problem coverage differs by more than 25% across arms "
+              f"({covs}). This is exactly the 2026-08-13 failure. Use the _eqp "
+              f"datasets as primary.")
 
     print("\neval problems -> %s (%d shared + %d extra)"
           % (outdir / "eval_problems.json", len(eval_pids),
