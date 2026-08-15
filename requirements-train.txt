@@ -3,23 +3,21 @@
 # Pin versions for reproducibility
 
 # PyTorch (T4 compatible)
-torch==2.1.0
-torchvision==0.16.0
-torchaudio==2.1.0
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
 
 # Transformers and related
-transformers==4.36.0
+transformers>=4.41.0
 tokenizers>=0.15.0
 accelerate>=0.25.0
 
 # TRL for SFT training
-trl==0.7.6
+trl>=0.7.6
 
 # PEFT for LoRA
-peft==0.7.1
-
-# vLLM for local inference (Kaggle)
-vllm==0.2.0
+peft>=0.7.1
+torchao>=0.16.0
 
 # Data handling
 datasets>=2.14.0
