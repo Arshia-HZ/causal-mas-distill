@@ -71,10 +71,8 @@ def append_cache(cache_path: str, key: str, scores: dict[str, float]):
         f.write(json.dumps({"key": key, "scores": scores}) + "\n")
 
 
-def checkpoint_key(arm: str, path: str) -> str:
-    """Unique key for a checkpoint. Normalizes trailing slashes."""
-    return f"{arm}::{path.rstrip('/')}"
-
+def checkpoint_key(arm, path, max_new_tokens):
+    return f"{arm}::{path.rstrip('/')}.mnt{max_new_tokens}"
 
 # ---------- bootstrap ------------------------------------------------------
 
@@ -103,7 +101,7 @@ def run_checkpoint_batched(model, tok, problems, max_new_tokens, batch_size):
     """
     import torch
 
-    stats = {"no_boxed": 0, "hit_cap": 0}
+    stats = {"no_boxed": 0, "no_stop": 0}
     scores = {}
     prompts_data = []
     for p in problems:
@@ -134,11 +132,12 @@ def run_checkpoint_batched(model, tok, problems, max_new_tokens, batch_size):
         prompt_len = encoded["input_ids"].shape[1]
         for j, (pid, gold, _) in enumerate(batch):
             gen_ids = out[j][prompt_len:]
+            gen_list = gen_ids.tolist()
             text = tok.decode(gen_ids, skip_special_tokens=True)
             if "\\boxed" not in text:
                 stats["no_boxed"] += 1
-            if len(gen_ids) >= max_new_tokens:
-                stats["hit_cap"] += 1
+            if 151645 not in gen_list and 151643 not in gen_list:
+                stats["no_stop"] += 1   # هرگز <|im_end|> یا <|endoftext|> نداده
             scores[pid] = 1.0 if is_correct(text, gold) else 0.0
 
         done = min(batch_start + batch_size, len(prompts_data))
@@ -148,9 +147,9 @@ def run_checkpoint_batched(model, tok, problems, max_new_tokens, batch_size):
                   flush=True)
 
     n = len(prompts_data)
-    print("  no-boxed: %d/%d (%.0f%%)   hit-cap: %d/%d (%.0f%%)"
+    print("  no-boxed: %d/%d (%.0f%%)   no-stop: %d/%d (%.0f%%)"
           % (stats["no_boxed"], n, 100 * stats["no_boxed"] / n if n else 0,
-             stats["hit_cap"], n, 100 * stats["hit_cap"] / n if n else 0))
+             stats["no_stop"], n, 100 * stats["no_stop"] / n if n else 0))
 
     return scores
 
@@ -227,7 +226,7 @@ def main():
         per_seed[arm] = []
         for path in paths:
             ckpt_idx += 1
-            key = checkpoint_key(arm, path)
+            key = checkpoint_key(arm, path,args.max_new_tokens)
 
             # Check cache first
             if key in cache:
