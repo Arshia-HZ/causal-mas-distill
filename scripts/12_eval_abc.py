@@ -103,6 +103,7 @@ def run_checkpoint_batched(model, tok, problems, max_new_tokens, batch_size):
     """
     import torch
 
+    stats = {"no_boxed": 0, "hit_cap": 0}
     scores = {}
     prompts_data = []
     for p in problems:
@@ -134,6 +135,10 @@ def run_checkpoint_batched(model, tok, problems, max_new_tokens, batch_size):
         for j, (pid, gold, _) in enumerate(batch):
             gen_ids = out[j][prompt_len:]
             text = tok.decode(gen_ids, skip_special_tokens=True)
+            if "\\boxed" not in text:
+                stats["no_boxed"] += 1
+            if len(gen_ids) >= max_new_tokens:
+                stats["hit_cap"] += 1
             scores[pid] = 1.0 if is_correct(text, gold) else 0.0
 
         done = min(batch_start + batch_size, len(prompts_data))
@@ -141,6 +146,11 @@ def run_checkpoint_batched(model, tok, problems, max_new_tokens, batch_size):
             acc_so_far = sum(scores.values()) / max(1, len(scores))
             print("  %d/%d  (running acc: %.3f)" % (done, len(prompts_data), acc_so_far),
                   flush=True)
+
+    n = len(prompts_data)
+    print("  no-boxed: %d/%d (%.0f%%)   hit-cap: %d/%d (%.0f%%)"
+          % (stats["no_boxed"], n, 100 * stats["no_boxed"] / n if n else 0,
+             stats["hit_cap"], n, 100 * stats["hit_cap"] / n if n else 0))
 
     return scores
 
@@ -183,21 +193,29 @@ def main():
     cache = load_cache(args.cache)
     cached_count = 0
 
-    # Load base model ONCE, then hot-swap LoRA adapters
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    print("\nLoading base model: %s" % BASE)
+    print("\nPreparing tokenizer: %s" % BASE)
     tok = AutoTokenizer.from_pretrained(BASE)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    # Set left padding for batched generation with decoder-only models
     tok.padding_side = "left"
 
-    base_model = AutoModelForCausalLM.from_pretrained(
-        BASE, torch_dtype=torch.float16, device_map="auto")
-    base_model.eval()
-    print("Base model loaded.\n")
+    def load_model_for(path):
+        """A FRESH base model per checkpoint.
+
+        The hot-swap version mutated the shared base in place; `del model`
+        removed only the wrapper, so adapters stacked (PEFT warned about
+        'multiple adapters in the model'). A fresh load costs ~30-60s from
+        the local HF cache and is correct.
+        """
+        fresh = AutoModelForCausalLM.from_pretrained(
+            BASE, dtype=torch.float16, device_map="auto")
+        if path and path.lower() != "base":
+            from peft import PeftModel
+            return PeftModel.from_pretrained(fresh, path).eval()
+        return fresh.eval()
 
     per_seed = {}
     t0 = time.time()
@@ -222,32 +240,15 @@ def main():
             print("\n[%s] %s  (%d/%d, t+%.0f min)"
                   % (arm, path, ckpt_idx, total_ckpts, elapsed))
 
-            # Attach LoRA if this is not the base model
-            if path and path.lower() != "base":
-                from peft import PeftModel
-                model = PeftModel.from_pretrained(base_model, path)
-                model.eval()
-            else:
-                model = base_model
-
+            model = load_model_for(path)
             scores = run_checkpoint_batched(
                 model, tok, problems, args.max_new_tokens, args.batch_size)
-
             per_seed[arm].append(scores)
-
-            # Save incrementally
             if args.cache:
                 append_cache(args.cache, key, scores)
                 print("  -> cached to %s" % args.cache)
-
-            # Unload LoRA adapter (but keep base model)
-            if path and path.lower() != "base":
-                del model
-                torch.cuda.empty_cache()
-
-    # Clean up GPU
-    del base_model
-    torch.cuda.empty_cache()
+            del model
+            torch.cuda.empty_cache()
 
     elapsed = (time.time() - t0) / 60
     print("\n\nAll checkpoints evaluated in %.0f min "
