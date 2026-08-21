@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from eval.grade import is_correct  # noqa: E402
 
-BASE = "Qwen/Qwen2.5-1.5B-Instruct"
+BASE = "Qwen/Qwen2.5-Math-1.5B"
 
 
 # ---------- cache helpers --------------------------------------------------

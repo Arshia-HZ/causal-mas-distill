@@ -52,7 +52,7 @@ import random
 import sys
 from pathlib import Path
 
-STUDENT = "Qwen/Qwen2.5-1.5B-Instruct"
+STUDENT = "Qwen/Qwen2.5-Math-1.5B"
 ARMS = ("a", "b", "c")
 
 

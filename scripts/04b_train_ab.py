@@ -57,7 +57,7 @@ def load_rows(path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dataset", required=True)
-    ap.add_argument("--model", default="Qwen/Qwen2.5-1.5B-Instruct")
+    ap.add_argument("--model", default="Qwen/Qwen2.5-Math-1.5B")
     ap.add_argument("--output-dir", default=None)
     ap.add_argument("--epochs", type=float, default=3.0)
     ap.add_argument("--batch-size", type=int, default=1)
